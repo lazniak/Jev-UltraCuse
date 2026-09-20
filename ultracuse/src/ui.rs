@@ -903,7 +903,7 @@ fn outcome_text(o: &Outcome) -> String {
         Outcome::Stalled => "Brak zmian na ekranie po akcjach".into(),
         Outcome::Killed => "Kill-switch Ctrl+Alt+K".into(),
         Outcome::Stopped => "Zatrzymane".into(),
-        Outcome::FocusLost(r) => format!("Ktoś inny wciąż przejmuje fokus — przerwane ({r})"),
+        Outcome::FocusLost(r) => format!("Fokus poza miejscem pracy — przerwane ({r})"),
         Outcome::TargetGone => "Okno zniknęło bez udziału pętli".into(),
     }
 }

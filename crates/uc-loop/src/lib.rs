@@ -49,6 +49,9 @@ pub mod consts {
     /// `Switch` visits per window and run: a second visit allows a round trip (copy
     /// there, paste back); a third is a ping-pong the survey refuses.
     pub const SWITCH_MAX_VISITS: u32 = 2;
+    /// Polls (of `SETTLE_CAP_MS`) tolerated with our own window in front before the
+    /// run ends: long enough for the user to reach Stop after restoring the window.
+    pub const OWN_WINDOW_STRIKES: u32 = 10;
     /// Windows minimized at most to reach the desktop.
     pub const SHOW_DESKTOP_MAX: usize = 8;
     /// Windows listed in a survey (front-most first).
@@ -790,8 +793,9 @@ pub mod survey {
     /// Floors: the winner's probability ≥ `CONF_FLOOR` and top-2 gap ≥ `TOP2_GAP_MIN`.
     /// (The element gate uses the model's `confidence` ≈ top-2 margin against the same
     /// floor, which is stricter; with twenty windows a margin floor would starve the
-    /// survey.) `exhausted`: windows switched to `SWITCH_MAX_VISITS` times already —
-    /// choosing one again is a ping-pong, reported as unsure so the ladder moves on.
+    /// survey.) `exhausted`: windows switched to `SWITCH_MAX_VISITS` times already (0 =
+    /// the desktop) — choosing one again is a ping-pong, reported as unsure so the
+    /// ladder moves on.
     pub fn judge(
         d: &uc_jev::Decision,
         candidates: &[WindowInfo],
@@ -829,6 +833,9 @@ pub mod survey {
         }
         let choice = match id {
             "desktop" if on_desktop => Choice::Stay,
+            "desktop" if exhausted.contains(&0) => Choice::Unsure(format!(
+                "survey: the desktop was shown {SWITCH_MAX_VISITS}× already"
+            )),
             "desktop" => Choice::Desktop,
             "none" => Choice::Nothing("survey: no open window fits the goal".into()),
             w => match by_id(w) {
@@ -1360,7 +1367,6 @@ impl Runner {
             if stop_set(&stop_flag) {
                 break Outcome::Stopped;
             }
-            steps += 1;
             let t0 = Instant::now();
 
             // 1. Perceive: coarse scene in µs, UIA tree in ms (the app's provider decides).
@@ -1368,15 +1374,16 @@ impl Runner {
             if scene.pid == own_pid {
                 // Our own window in front (the GUI not yet minimized, or restored by the
                 // user): never the place — AccessKit would offer our own Start/Stop to
-                // Jev. Wait a moment; give up when it stays.
+                // Jev. Not a step: wait, and give up when it stays.
                 own_strikes += 1;
-                if own_strikes >= consts::DISPLACED_STRIKES {
+                if own_strikes >= consts::OWN_WINDOW_STRIKES {
                     break Outcome::FocusLost("own window in front".into());
                 }
-                std::thread::sleep(Duration::from_millis(consts::FOCUS_SETTLE_MS));
+                std::thread::sleep(Duration::from_millis(consts::SETTLE_CAP_MS));
                 continue;
             }
             own_strikes = 0;
+            steps += 1;
             let mut displaced_now = false;
             match (place_hwnd, place_pid) {
                 (Some(h), Some(pid)) if scene.pid != pid => {
@@ -1982,8 +1989,15 @@ impl Runner {
                                     action,
                                     policy::Action::Switch { .. } | policy::Action::ShowDesktop
                                 );
-                                if let policy::Action::Switch { hwnd, .. } = action {
-                                    *visits.entry(*hwnd).or_default() += 1;
+                                // Visit counts; the desktop is key 0 (never a window handle).
+                                match action {
+                                    policy::Action::Switch { hwnd, .. } => {
+                                        *visits.entry(*hwnd).or_default() += 1;
+                                    }
+                                    policy::Action::ShowDesktop => {
+                                        *visits.entry(0).or_default() += 1;
+                                    }
+                                    _ => {}
                                 }
                                 // A new window is a new tree: no stall comparison across it.
                                 last_hash = if window_op { None } else { Some(hash) };
