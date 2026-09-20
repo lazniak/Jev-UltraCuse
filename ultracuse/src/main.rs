@@ -318,7 +318,7 @@ fn bench_uia(delay: u64, runs: usize, context: bool, hwnd: Option<isize>) -> Res
         },
     );
     let out = json!({
-        "bench": "R1-uia-rust", "app": scene.exe, "title": scene.title, "runs": runs, "context": context,
+        "bench": "R1-uia-rust", "ts_unix": ts_unix(), "app": scene.exe, "title": scene.title, "runs": runs, "context": context,
         "raw_count": last.raw_count, "kept": last.elements.len(), "reduced": reduced.len(),
         "total_ms": {"min": totals[0], "p50": percentile(&totals, 0.5), "p95": percentile(&totals, 0.95), "max": totals[runs-1]},
         "find_ms":  {"min": finds[0],  "p50": percentile(&finds, 0.5),  "p95": percentile(&finds, 0.95)},
@@ -482,7 +482,7 @@ fn bench_jev(runs: usize, sizes: &str, hedge_ms: u64, provider: Option<&str>) ->
             totals.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let d = first.expect("at least one run");
             let out = json!({
-                "bench": "R2-jev-rust", "provider": provider, "model": d.model, "n_elements": n, "runs": runs,
+                "bench": "R2-jev-rust", "ts_unix": ts_unix(), "provider": provider, "model": d.model, "n_elements": n, "runs": runs,
                 "hedge_ms": hedge_ms, "hedge_wins": hedge_wins, "requests_sent": client.requests_sent.load(std::sync::atomic::Ordering::Relaxed),
                 "input_tokens": d.usage.input_tokens, "cost_per_call_usd": d.cost_usd,
                 "http_ms": {"min": http[0], "p50": percentile(&http, 0.5), "p95": percentile(&http, 0.95), "max": http[runs-1]},
@@ -508,4 +508,11 @@ fn ps(script: &str, allow_destructive: bool) -> Result<()> {
         out.elapsed.as_secs_f64() * 1000.0
     );
     Ok(())
+}
+
+fn ts_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }

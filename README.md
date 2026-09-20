@@ -16,7 +16,7 @@ Jev odpowiada tylko na *które / czy / jak bardzo* (jeden POST, wiele pytań, ~3
 
 ## Budowa
 
-Wymagania: Rust 1.85+ (MSVC), Windows 11, klucz Jev (`JEV_API_KEY` vendora lub `OPENROUTER_API_KEY`) w env lub `HKCU\Environment`.
+Wymagania: Rust 1.85+ (MSVC), Windows 11, klucz Jev w env lub `HKCU\Environment`: domyślnie końcówka vendora (`JEV_API_KEY`); opcjonalnie OpenRouter (`OPENROUTER_API_KEY` lub `OPEN_ROUTER_API_KEY`), wymuszany przez `--provider openrouter` albo `UC_PROVIDER=openrouter`.
 
 ```bash
 cargo build --release

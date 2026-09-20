@@ -43,7 +43,11 @@ impl Provider {
     pub fn key_names(self) -> &'static [&'static str] {
         match self {
             Provider::Typesafe => &["JEV_API_KEY", "TYPESAFE_API_KEY"],
-            Provider::OpenRouter => &["OPENROUTER_API_KEY", "JEVUSE_API_KEY"],
+            Provider::OpenRouter => &[
+                "OPENROUTER_API_KEY",
+                "OPEN_ROUTER_API_KEY",
+                "JEVUSE_API_KEY",
+            ],
         }
     }
     pub fn accepts_session_id(self) -> bool {
@@ -295,6 +299,16 @@ pub struct Config {
 
 impl Config {
     pub fn discover() -> Result<Self, JevError> {
+        // `UC_PROVIDER=openrouter` forces the aggregator; the default is vendor-first.
+        if let Some(p) =
+            user_env("UC_PROVIDER").and_then(|v| match v.to_ascii_lowercase().as_str() {
+                "typesafe" | "vendor" | "jev" => Some(Provider::Typesafe),
+                "openrouter" | "or" => Some(Provider::OpenRouter),
+                _ => None,
+            })
+        {
+            return Self::for_provider(p);
+        }
         let (provider, api_key, _) = discover().ok_or(JevError::NoKey)?;
         Ok(Self {
             provider,

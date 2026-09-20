@@ -61,6 +61,7 @@ Skala: ✅ przewaga · ➖ neutralne · ❌ wada. Liczby: z research JevUse §3.
 | Zimny / ciepły start | **46 ms / 20–22 ms** | ~1.8 s onefile (literatura) |
 | Skan UIA Notatnik / Chrome / Claude(Electron), p50 | 380 / 108 / 464 ms | 388 / 106 / 478 ms — **to samo** |
 | Jev http p50, vendor, N=12/30/60 | **274 / 288 / 297 ms** | 304 / 292 / 320 ms |
+| Jev http p50, OpenRouter, N=12/30/60 (seria B; vendor w tym samym oknie 302 / 287 / 286) | **294 / 314 / 323 ms** | 367 / 325 / 371 ms (`cu_bench`, 4 pytania) |
 | Ciepła komenda PowerShell | 0.6–19 ms (sesja 140 ms, pierwsza komenda ~500 ms JIT) | spawn per komenda 300–600 ms |
 
 Werdykt bez upiększeń: UIA kosztuje tyle samo w obu językach (provider aplikacji); Rust wygrywa tam, gdzie miał wygrać — binarka, start, klient HTTP, brak GIL.

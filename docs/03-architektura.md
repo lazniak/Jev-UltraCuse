@@ -49,7 +49,7 @@ Zasady: COM tylko na T2 (typy `!Send`); żadnej alokacji ani I/O w ścieżce `Se
       │ 3. CACHE MAKR  0 ms                                                │
       │    (goal_norm, hash_norm) → decyzja z poprzedniego runu            │
       ├────────────────────────────────────────────────────────────────────┤
-      │ 4. JEV  ~290–330 ms (1 POST, hedged po 400 ms, timeout 1.5 s)      │
+      │ 4. JEV  ~290–330 ms (1 POST, hedge-straż po 600 ms, timeout 1.5 s) │
       │    state = {goal, scene, elements, last, dictated?}                │
       │    questions = {target, op, goal_reached, needs_text,              │
       │                 is_destructive, progress, recovery}                │
@@ -132,7 +132,7 @@ Bramka Tier 0 przed wykonaniem: komenda musi być ASCII bez polskich czasownikó
 
 ## 8. Klient Jev (gorący)
 
-- Provider vendor-first (`api.typesafe.ai/v1/systemone`, model **pinowany** `jev-1.13.0`), fallback OpenRouter (`/api/alpha/decisions`, `typesafe/jev-1.13`); klucze z env **i** `HKCU\Environment` (`JEV_API_KEY`, `TYPESAFE_API_KEY`, `OPENROUTER_API_KEY`, `JEVUSE_API_KEY`).
+- Provider vendor-first (`api.typesafe.ai/v1/systemone`, model **pinowany** `jev-1.13.0`), fallback OpenRouter (`/api/alpha/decisions`, `typesafe/jev-1.13`); klucze z env **i** `HKCU\Environment` (vendor: `JEV_API_KEY`, `TYPESAFE_API_KEY`; OpenRouter: `OPENROUTER_API_KEY`, `OPEN_ROUTER_API_KEY`, `JEVUSE_API_KEY`). `UC_PROVIDER=typesafe|openrouter` wymusza końcówkę (CLI: `--provider`). Zmierzone 2026-09-20: OpenRouter +27…+39 ms p50 od N=30, ten sam floor 267 ms (`bench/R2-jev.md` seria B).
 - `reqwest` (rustls, http2 prior knowledge gdzie możliwe, keep-alive), nagłówki raz; body = prefiks + state + pytania (pytania skompilowane do bajtów per snapshot).
 - Rozgrzewka **mini-decyzją** (HEAD na vendorze ~600 ms i nie gwarantuje keep-alive), odświeżanie co 45 s.
 - **Hedging**: drugi identyczny POST po 400 ms, wygrywa pierwszy, drugi anulowany; koszt 2× tylko na ogonie; raportowany osobno.
@@ -174,7 +174,7 @@ lab/           (opcjonalnie) linki do D:\code\JevUse — eksperymenty Python
 | # | Eksperyment | Rozstrzyga |
 |---|---|---|
 | R1 | UIA Rust vs Python: ten sam skan (Notatnik, Eksplorator, Ustawienia, Chrome, VS Code) ×20 | czy natywny klient cokolwiek zmienia w percepcji (oczekiwanie: nie; RPC dominuje) |
-| R2 | Jev z Rust: p50/p95 vendor vs OpenRouter, plain vs hedged, N=12/30/60/120 | próg hedgingu, wybór końcówki |
+| R2 | Jev z Rust: p50/p95 vendor vs OpenRouter, plain vs hedged, N=12/30/60/120 — **zrobione 2026-09-20** (`bench/R2-jev.md`): vendor domyślny, hedge jako straż 600 ms | próg hedgingu, wybór końcówki |
 | R3 | STT: ostatnie słowo → finał, p50/p95, PL, 3 silniki (ADR-002) | silnik domyślny |
 | R4 | E2E 10 zadań × 3 runy (Notatnik zapisz jako; Eksplorator nowy folder; Ustawienia tryb ciemny; Chrome szukaj; Kalkulator 12×34; …): czas, kroki, koszt, sukces, eskalacje; te same zadania na kofanlabs | „najszybszy" — albo nie |
 | R5 | Kryteria PL vs EN na 30 ekranach | język pytań |

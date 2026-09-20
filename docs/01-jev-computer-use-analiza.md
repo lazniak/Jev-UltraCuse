@@ -26,7 +26,7 @@ Wąskim gardłem „najszybszego Computer Use" **nie jest język programowania a
 | Fakt | Wartość | Źródło |
 |---|---|---|
 | Endpoint vendora | `POST https://api.typesafe.ai/v1/systemone`, model `jev-latest` (→ `jev-1.13.0`), aliasy `jev-preview` | `/api.md`, `/models.md` |
-| Endpoint OpenRouter | `POST https://openrouter.ai/api/alpha/decisions`, model `typesafe/jev-1.13` (permaslug `typesafe/jev-1.13-20260917`), alias `~typesafe/jev-latest` | strona modelu OR, `jev-1.13-openrouter.md` |
+| Endpoint OpenRouter | `POST https://openrouter.ai/api/alpha/decisions`, model `typesafe/jev-1.13` (permaslug `typesafe/jev-1.13-20260917` — przyjmowany też jako `model` w żądaniu, 200 potwierdzone 2026-09-20), alias `~typesafe/jev-latest` | strona modelu OR, `jev-1.13-openrouter.md` |
 | Cena | **$0.042 / 1M tokenów wejścia, wyjście $0** — identyczna na obu końcówkach | `/models.md`, OR |
 | Kontekst | vendor: **64k/request, 32k na `state` + najdłuższe pytanie**; OpenRouter: 32k | `/models.md` |
 | Rate limit (vendor) | 250 000 tok/s, 1 200 req/min, **„adjusting dynamically"** | `/models.md` |
@@ -38,7 +38,7 @@ Wąskim gardłem „najszybszego Computer Use" **nie jest język programowania a
 | Błędy | vendor: 401, **422** (walidacja), 429, 529; OR: 400, 401, 402, 413, 429, 502, 529 | `/api.md`, OR |
 | Retry | 429/529 → wykładniczy backoff; nigdy natychmiast | `/api.md` |
 | `session_id`, `user`, `provider`, `trace` | **tylko OpenRouter** — vendor zwraca 400 `api_usage_error` (potwierdzone na żywo 2026-09-20) | `research-2026-09-20-jev-cu.md` §1.5 |
-| `usage.cost` | OpenRouter raportuje; **vendor nie** — liczyć z ceny | `api.md` (jevskill) |
+| `usage.cost` | OpenRouter raportuje (sprawdzone: 344 tok → $0.0000144 = $0.042/Mtok); **vendor nie** — liczyć z ceny | `api.md` (jevskill) |
 | SDK | oficjalne: `pip install typesafe_sdk` (`TypeSafeClient.system_one(state, questions)`), `npm i @typesafe-ai/sdk`; community: Go, Java. **Brak Rust** — docs: „You can also call the HTTP API directly from any language." | `/sdk.md` |
 | Dostęp | OpenRouter: natychmiast z kredytami; vendor: waitlista, klucze partiami | `api.md` (jevskill) |
 | Alias `jev-latest` | **przesuwa się** — odpowiedź zawiera versioned id; progi kalibrowane pod wersję → pinować | `api.md` (jevskill) |
@@ -91,6 +91,7 @@ Zasady wyprowadzone z semantyki API (JevUse §6.4, potwierdzone pomiarem):
 | **cu_bench na końcówce vendora** | N=12: **304 ms**; N=30: **292**; N=60: **320** — o hop mniej: **−33…−63 ms, węższy ogon** (max 333–401 vs 431–485) | j.w., 2026-09-20 |
 | warm HEAD `/v1/models` | vendor ~600 ms vs OpenRouter ~90 ms → rozgrzewać **prawdziwą mini-decyzją**, nie HEAD | j.w. |
 | **Rust `uc-jev`, vendor, 5 pytań** (2026-09-20) | N=12: **274.5 ms** (1 469 tok); N=30: **287.9**; N=60: **297.5**; floor 258–275; rozgrzewka zimnego połączenia 708–754 ms; hedging 400 ms nie wygrał ani razu (p95 324–417) | `bench/R2-jev.md` |
+| **Rust `uc-jev`, vendor vs OpenRouter w jednym oknie** (2026-09-20 22:02–22:07, 10 wywołań/rozmiar) | vendor N=12/30/60/120: **302 / 287 / 286 / 328 ms**; OpenRouter: **294 / 314 / 323 / 367 ms** → OpenRouter +27…+39 ms p50 od N=30 (narzut rośnie z ładunkiem), p95 +54…+85 ms, floor identyczny 267 ms; hedge 350 ms: 5 wystrzelonych, 0 wygranych (max w 110 wywołaniach 425 ms < 350 + floor) | `bench/R2-jev.md` seria B |
 | Koszt kroku CU | ~$0.0001–0.0003 (1.7k–6k tok); 1 000 kroków ≈ $0.04–0.34 | j.w. + JevUse §8.5 |
 | Mały LLM na trywialnym pytaniu | gemini-2.5-flash-lite: $0.0000057 vs Jev $0.0000133 — **Jev nie wygrywa ceną pojedynczego pytania**, wygrywa strukturą, rozkładami i fan-outem | jevskill E6 |
 
@@ -181,7 +182,7 @@ Dodatkowo z `/concepts/state.md`: „lower accuracy for non-English content, par
 | Percepcja | 5–60 ms **tylko z cache drzewa + zdarzeniami UIA**; pełny skan zmierzony (R1, `bench/R1-uia.md`): Chrome 108 ms, Notatnik Win11 380 ms, Electron 464 ms — identycznie w Rust i Python | UIA tylko aktywne okno, **jedno** `FindAllBuildCache` z OR-warunkiem + `CacheRequest` (99.9 % czasu po stronie providera a11y — język klienta nie ma znaczenia); invalidacja cache zdarzeniami `StructureChanged`/`PropertyChanged`; Win32 (kursor/okna) w µs; **bez OCR na gorącej ścieżce** |
 | Redukcja + hash | ≤ 2 ms | kod |
 | Cache makr | 0 ms przy trafieniu | klucz = (cel znormalizowany, hash drzewa znormalizowanego) → decyzja |
-| **Decyzja Jev** | **~290–330 ms** (floor: sieć ~60 ms + inferencja ~250 ms) | 1 wywołanie; ciepłe h2; końcówka vendora (−30…−60 ms); **hedging**: drugi identyczny POST po ~400 ms, wygrywa pierwszy (ogon p95 z ~450–530 do ~400); timeout 1.5 s |
+| **Decyzja Jev** | **~290–330 ms** (floor: sieć ~60 ms + inferencja ~250 ms) | 1 wywołanie; ciepłe h2; końcówka vendora (−30…−60 ms); **hedging** tylko jako straż przed zawieszeniem: drugi identyczny POST po ~600 ms (2×p50) — hedge z progu 350–400 ms wygrał 0/8 razy, bo wygrywa dopiero przy stallu > próg + floor ≈ 620 ms, a max z 110 wywołań to 425 ms; timeout 1.5 s |
 | Walidacja | < 1 ms | element istnieje, bbox na ekranie, nie zasłonięty, `op` dozwolony dla roli, próg per typ |
 | Akcja | < 1–5 ms | UIA `Invoke`/`SetValue` gdy dostępne; inaczej **jeden `SendInput`** z całą sekwencją (ruch+klik, chord, tekst) |
 | Settle | 0–200 ms | czekaj na zdarzenie UIA lub zmianę hasha; cap 200 ms (jev-ultrafast: 50 ms / 2 klatki; combobox 200 ms) |
@@ -195,7 +196,7 @@ Liczba kroków jest ważniejsza niż ms w kroku: OSWorld-Human (arXiv 2506.16042
 
 1. **Alpha API / jeden provider** — brak failoveru na inny model decyzyjny; wymagany tryb degradacji (LLM lub tylko dyktowanie).
 2. **Rate limity dynamiczne** — 1 200 req/min to ~20 kroków/s; pętla 2–3 kroki/s mieści się z zapasem, ale honorować `retry-after`.
-3. **Klucz vendora** — waitlista; na tej maszynie są oba klucze w `HKCU\Environment`: `JEV_API_KEY` (vendor, użyty już w `cu_bench`) i `JEVUSE_API_KEY` (OpenRouter). Klient czyta rejestr, nie tylko env procesu (zmienne ustawione po starcie terminala nie dziedziczą się). Vendor-first, OpenRouter jako fallback.
+3. **Klucz vendora** — waitlista; na tej maszynie są oba klucze w `HKCU\Environment`: `JEV_API_KEY` (vendor, domyślny) i `OPEN_ROUTER_API_KEY` (OpenRouter, odświeżony 2026-09-20; stary `JEVUSE_API_KEY` wygasł — 401). Klient czyta rejestr, nie tylko env procesu (zmienne ustawione po starcie terminala nie dziedziczą się); nazwy dla OpenRouter w kolejności: `OPENROUTER_API_KEY`, `OPEN_ROUTER_API_KEY`, `JEVUSE_API_KEY`. Vendor-first; OpenRouter tylko na żądanie (`--provider openrouter`, `UC_PROVIDER=openrouter`) albo gdy brak klucza vendora.
 4. **Polskie kryteria** — docs ostrzegają o niższej dokładności poza angielskim; potrzebny test A/B PL vs EN na tych samych ekranach.
 5. **Kalibracja progów** — `confidence` mierzy koncentrację rozkładu, nie poprawność; progi 0.6/0.85 to punkt startu, mierzyć na własnych parach decyzja→wynik.
 6. **Pokrycie UIA** — Electron/canvas/Spotify: 0% widoczności → OCR/VLM ≥ 600 ms; mierzyć odsetek kroków na fallbacku per aplikacja.

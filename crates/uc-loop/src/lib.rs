@@ -20,8 +20,11 @@ pub mod consts {
     pub const MAX_CANDIDATES: usize = 60;
     /// Settle cap after an action (jev-ultrafast: 50 ms / 2 frames; combobox 200 ms).
     pub const SETTLE_CAP_MS: u64 = 200;
-    /// Hedge an in-flight decision after this delay.
-    pub const HEDGE_AFTER_MS: u64 = 400;
+    /// Hedge an in-flight decision after this delay. A hedge can only win when the
+    /// first request stalls past `delay + floor` (floor ≈ 267 ms from PL); with a
+    /// 350–400 ms delay it won 0/8 times in R2 (max of 110 calls: 425 ms), so this is
+    /// a stall guard at ~2×p50, not a tail trimmer (`bench/R2-jev.md`).
+    pub const HEDGE_AFTER_MS: u64 = 600;
     pub const DECISION_TIMEOUT_MS: u64 = 1500;
 
     /// Names on controls that make an action irreversible regardless of what Jev says.
