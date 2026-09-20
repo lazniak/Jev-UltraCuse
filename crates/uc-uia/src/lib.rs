@@ -120,15 +120,17 @@ const CT_NAMES: [(i32, &str); 41] = [
     (50040, "appbar"),
 ];
 
-/// Control types that can be acted on. Mirrors `CORE_INTERACTIVE` in the Python reference.
-pub const INTERACTIVE_IDS: [i32; 15] = [
+/// Control types that can be acted on. Mirrors `CORE_INTERACTIVE` in the Python reference,
+/// plus `document` (50030): Notepad/WordPad/browsers expose the text area as a document,
+/// and without it the state has no field to type into (found on the first MVP run).
+pub const INTERACTIVE_IDS: [i32; 16] = [
     50000, 50002, 50003, 50004, 50005, 50007, 50011, 50013, 50015, 50016, 50019, 50024, 50029,
-    50031, 50035,
+    50030, 50031, 50035,
 ];
 
 /// Extra types scanned only when `include_context` is on (labels, custom widgets):
 /// they give Jev context ("Payment successful") at the cost of state size.
-pub const CONTEXT_IDS: [i32; 3] = [50020, 50025, 50030];
+pub const CONTEXT_IDS: [i32; 2] = [50020, 50025];
 
 pub fn role_name(ct: i32) -> &'static str {
     CT_NAMES
@@ -349,14 +351,15 @@ unsafe fn read_cached(
 // ---------------------------------------------------------------------------------------
 
 /// Form controls are meaningful even without a name (an empty text field).
-const UNNAMED_OK: [&str; 7] = [
-    "edit", "checkbox", "combobox", "radio", "slider", "spinner", "text",
+const UNNAMED_OK: [&str; 8] = [
+    "edit", "document", "checkbox", "combobox", "radio", "slider", "spinner", "text",
 ];
 
 fn role_weight(role: &str) -> i32 {
     match role {
         "button" | "splitbutton" | "link" | "menuitem" => 3,
-        "tabitem" | "checkbox" | "combobox" | "edit" | "radio" | "slider" | "spinner" => 2,
+        "tabitem" | "checkbox" | "combobox" | "edit" | "document" | "radio" | "slider"
+        | "spinner" => 2,
         "listitem" | "treeitem" | "dataitem" | "headeritem" | "custom" | "text" => 1,
         _ => 0,
     }

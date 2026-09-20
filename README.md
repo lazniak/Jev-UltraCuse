@@ -29,6 +29,21 @@ target\release\ultracuse.exe ps "Get-ChildItem $env:USERPROFILE\Desktop | Select
 
 `click` i każda akcja wymagają `--act`; globalny kill-switch **Ctrl+Alt+K**.
 
+## Szybki start (MVP-1)
+
+```powershell
+ultracuse doctor                                                      # DPI, UIA, pwsh, klucz Jev + jedna mini-decyzja
+ultracuse run "Wpisz „hello ultracuse” w edytorze tekstu"            # podgląd: 3 s na przełączenie okna, pokazuje pierwszą decyzję, nic nie wstrzykuje
+ultracuse run "Wpisz „hello ultracuse” w edytorze tekstu" --act      # uzbrojone: wpisuje, sprawdza cel, kończy
+ultracuse run "Zamknij kartę bez zapisywania zmian" --act --allow-irreversible --hwnd 23399772
+```
+
+Co robi jeden krok: skan UIA okna na wierzchu → redukcja do ≤ 60 kandydatów → **jedno** wywołanie Jev z siedmioma pytaniami (`target`, `op`, `key`, `goal_reached`, `goal_pending`, `needs_text`, `is_destructive`) → bramka w kodzie (progi, zgodność sygnałów, lista nieodwracalnych) → `SendInput` → settle. Tekst do wpisania bierze z cudzysłowu w celu („…”, "…", '…') albo z `--text`; Jev nigdy nie generuje tekstu.
+
+Bezpieczniki: domyślnie podgląd (`--act` uzbraja); pętla działa tylko, gdy na wierzchu jest **proces okna, na którym wystartowała** — sprawdzane przy skanie **i ponownie tuż przed wstrzyknięciem**, bo decyzja trwa 0.3–2 s (inny proces → `FocusLost`, nic nie wstrzyknięte; okno znika → `TargetGone`); kontrolki z listy nieodwracalnych i kroki, które Jev ocenia jako destrukcyjne (≥ 0.5), wymagają `--allow-irreversible` **i** pewności ≥ 0.85; kill-switch **Ctrl+Alt+K**. Każdy przebieg zostawia ledger JSONL w `runs/` (krok po kroku: sygnały, werdykt, czasy, koszt). Kody wyjścia: 0 = cel osiągnięty / podgląd, 2 = zatrzymane (niepewność, blokada, brak tekstu, budżet kroków, utrata fokusu), 3 = okno docelowe zniknęło (`TargetGone` — przy celach typu „zamknij” to zwykle sukces, ale kod tego nie rozstrzyga).
+
+Zmierzone (`bench/R4-mvp-run.md`): wpisanie tekstu do Notatnika — 2 kroki, 1.04 s, $0.00022; zamknięcie karty bez zapisu przez menu i dialog — 5 kroków, 2.7 s, $0.00048.
+
 ## Liczby
 
 Każda liczba w tym README pochodzi ze skryptu w `bench/` z datą i maszyną. Do czasu pierwszych pomiarów R1–R4 (patrz [TASKS.md](TASKS.md)) jedyne liczby to te odziedziczone z laboratorium Python — w [docs/01](docs/01-jev-computer-use-analiza.md) §3.

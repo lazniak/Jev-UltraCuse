@@ -17,8 +17,9 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows::Win32::UI::WindowsAndMessaging::{
     GetClassNameW, GetCursorPos, GetForegroundWindow, GetSystemMetrics, GetWindowRect,
-    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, SM_CXVIRTUALSCREEN,
-    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
+    SetForegroundWindow, ShowWindow, SwitchToThisWindow, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_RESTORE,
 };
 
 /// Rectangle as `[x, y, w, h]` in physical screen pixels.
@@ -40,6 +41,38 @@ pub fn foreground_hwnd() -> Option<HWND> {
     } else {
         Some(h)
     }
+}
+
+/// Bring a window to the front (restoring it if minimised) and report whether it is
+/// now the foreground window. `SwitchToThisWindow` gets past the foreground lock that
+/// `SetForegroundWindow` hits when the caller has had no recent input.
+pub fn bring_to_front(hwnd: HWND) -> bool {
+    // SAFETY: plain user32 calls on a handle we do not own.
+    unsafe {
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
+        // Check first: `SwitchToThisWindow(_, true)` has Alt-Tab semantics and toggles
+        // *away* from a window that is already in front.
+        for attempt in 0..10 {
+            if GetForegroundWindow() == hwnd {
+                return true;
+            }
+            if attempt % 2 == 0 {
+                let _ = SetForegroundWindow(hwnd);
+            } else {
+                SwitchToThisWindow(hwnd, true);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        GetForegroundWindow() == hwnd
+    }
+}
+
+/// Does the handle still name a window? False once the target closed.
+pub fn is_window(hwnd: HWND) -> bool {
+    // SAFETY: pure query on a handle value.
+    unsafe { IsWindow(Some(hwnd)).as_bool() }
 }
 
 pub fn window_title(hwnd: HWND) -> String {

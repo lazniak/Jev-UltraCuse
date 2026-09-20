@@ -179,3 +179,20 @@ lab/           (opcjonalnie) linki do D:\code\JevUse — eksperymenty Python
 | R4 | E2E 10 zadań × 3 runy (Notatnik zapisz jako; Eksplorator nowy folder; Ustawienia tryb ciemny; Chrome szukaj; Kalkulator 12×34; …): czas, kroki, koszt, sukces, eskalacje; te same zadania na kofanlabs | „najszybszy" — albo nie |
 | R5 | Kryteria PL vs EN na 30 ekranach | język pytań |
 | R6 | Kalibracja: pary decyzja→wynik, ECE per pytanie | progi 0.6/0.85 → własne |
+
+## 13. Stan implementacji — MVP-1 (2026-09-20, `ultracuse run`)
+
+Pierwszy prototyp domyka pętlę z §3 na żywym oknie (`bench/R4-mvp-run.md`), świadomie prościej niż docelowy projekt:
+
+| element projektu | MVP-1 | docelowo (TASKS) |
+|---|---|---|
+| wątki T0–T5 (§2) | jeden wątek: STA dla UIA + `tokio` `block_on` dla HTTP | 1.1, 1.3 |
+| settle po akcji | stały sleep `SETTLE_CAP_MS` = 200 ms, potem porównanie hasha drzewa w kodzie | zdarzenia UIA + hash (1.1) |
+| pytania kroku | 7 w jednym wywołaniu: `target`, `op`, `key`, `goal_reached` + `goal_pending` (uśrednione), `needs_text`, `is_destructive`; brak `progress`/`recovery` | 1.4 → 1.5 |
+| bliskie rozstrzygnięcie `target` | druga runda w tym samym kroku: **bramki noul per finalista** (nie `choice` 2-way — ten zostaje 50/50, gdy obie drogi są poprawne) | kalibracja R6 |
+| bramka w kodzie | progi z `consts`, zgodność `goal_reached` ∧ `op=done`, lista nieodwracalnych + `is_destructive ≥ 0.5` → `--allow-irreversible` i ≥ 0.85 (click, key i type), kontrolki `disabled` odrzucane, blokada na pid okna + `IsWindow` sprawdzane przy skanie i tuż przed `SendInput` | 1.6 (IsPassword), 2.4 (potwierdzenie głosem) |
+| executor | `SendInput` przez `uc-input` (click, type/paste, key, scroll); bez wzorców UIA | 1.2 |
+| tekst do wpisania | cudzysłów w celu albo `--text` | dyktowanie (2.x) |
+| percepcja | UIA bez `--context`; `document` (50030) w interaktywnych; wartość RichEdit niewidoczna | `TextPattern` (1.8), OCR (3.3) |
+| cache makr, System Two, głos, tray | brak | 1.5, 3.4, 2.x, 3.1 |
+| ledger | JSONL per przebieg w `runs/` (na gorącej ścieżce, `writeln!`) | poza gorącą ścieżką (1.3) |

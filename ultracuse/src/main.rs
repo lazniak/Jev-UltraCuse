@@ -1,5 +1,6 @@
-//! `ultracuse` CLI — today: diagnostics and the measurements that justify the design
-//! (R1 UIA scan, R2 Jev round-trip from Rust). The voice loop lands after ADR-002.
+//! `ultracuse` CLI — the MVP loop (`run`), diagnostics (`doctor`, `probe`) and the
+//! measurements that justify the design (R1 UIA scan, R2 Jev round-trip). Voice lands
+//! after ADR-002 (TASKS 2.x).
 
 use std::time::{Duration, Instant};
 
@@ -67,6 +68,8 @@ enum Cmd {
         #[arg(long)]
         allow_destructive: bool,
     },
+    /// MVP loop: perceive the foreground window, ask Jev, act (with --act), repeat.
+    Run(RunArgs),
     /// Inject a click at screen coordinates (requires --act).
     Click {
         x: i32,
@@ -104,6 +107,7 @@ fn main() -> Result<()> {
             script,
             allow_destructive,
         } => ps(&script, allow_destructive),
+        Cmd::Run(a) => run(a),
         Cmd::Click { x, y, act } => {
             if !act {
                 println!("would click ({x}, {y}) — pass --act to inject");
@@ -390,56 +394,8 @@ fn synthetic_state(
         "none".into(),
         "No listed element advances `goal`; a key, scroll or wait is needed.".into(),
     ));
-    let crit: Vec<(&str, String)> = criteria
-        .iter()
-        .map(|(k, v)| (k.as_str(), v.clone()))
-        .collect();
     let state = json!({"goal": "Save the current document and close the dialog", "scene": {"app": "editor", "title": "Untitled - Editor - Save changes?", "fg": true}, "last": {"op": "key", "key": "Ctrl+W"}, "elements": elements});
-    let mut q = serde_json::Map::new();
-    q.insert(
-        "target".into(),
-        uc_jev::choice(
-            "Which element in `elements` should be acted on next to advance `goal`?",
-            &crit,
-        ),
-    );
-    q.insert(
-        "op".into(),
-        uc_jev::choice(
-            "What kind of input advances `goal` from this screen?",
-            &[
-                ("click", "Activate a visible control.".into()),
-                ("type", "Enter text into a focused text field.".into()),
-                (
-                    "key",
-                    "Press a keyboard shortcut (Enter, Esc, Ctrl+S).".into(),
-                ),
-                ("scroll", "Content needed is not visible yet.".into()),
-                ("wait", "The UI is still loading or animating.".into()),
-                (
-                    "done",
-                    "`goal` is already satisfied by the visible state.".into(),
-                ),
-            ],
-        ),
-    );
-    q.insert(
-        "goal_reached".into(),
-        uc_jev::noul(
-            "Is `goal` already satisfied by `elements` and `scene.title`?",
-            "The visible state shows `goal` completed; nothing more to do.",
-            "At least one step of `goal` is still pending.",
-        ),
-    );
-    q.insert(
-        "needs_text".into(),
-        uc_jev::noul(
-            "Does the next step toward `goal` require typing new text?",
-            "A text field must receive content before `goal` can advance.",
-            "No typing is needed for the next step.",
-        ),
-    );
-    q.insert("is_destructive".into(), uc_jev::noul("Would the most likely next action delete data, send a message, pay, or otherwise be hard to undo?", "The next action is irreversible or destructive.", "The next action is safe and reversible."));
+    let q = uc_loop::questions::bundle(&criteria);
     (state, q)
 }
 
@@ -515,4 +471,184 @@ fn ts_unix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[derive(clap::Args)]
+struct RunArgs {
+    /// The goal, in any language. Text to type goes in quotes: „…”, "…" or '…' (or --text).
+    goal: String,
+    /// Inject input. Without it the loop shows the first decision and stops.
+    #[arg(long)]
+    act: bool,
+    #[arg(long, default_value_t = uc_loop::consts::MAX_STEPS_DEFAULT)]
+    max_steps: usize,
+    /// Text for `type` steps (overrides the quoted part of the goal).
+    #[arg(long)]
+    text: Option<String>,
+    /// Allow actions on controls named delete/send/pay… and steps Jev rates destructive.
+    #[arg(long)]
+    allow_irreversible: bool,
+    /// Seconds to switch to the target window before the first step (ignored with --hwnd).
+    #[arg(long, default_value_t = 3)]
+    delay: u64,
+    /// Bring this window to the front first (from `(Get-Process notepad).MainWindowHandle`).
+    #[arg(long)]
+    hwnd: Option<isize>,
+    /// typesafe | openrouter (default: vendor first).
+    #[arg(long)]
+    provider: Option<String>,
+    /// One JSON line per step instead of text.
+    #[arg(long)]
+    json: bool,
+    /// Where the JSONL ledger goes (one file per run).
+    #[arg(long, default_value = "runs")]
+    ledger_dir: String,
+}
+
+fn run(a: RunArgs) -> Result<()> {
+    let provider = match a.provider.as_deref() {
+        None => None,
+        Some("typesafe") => Some(uc_jev::Provider::Typesafe),
+        Some("openrouter") => Some(uc_jev::Provider::OpenRouter),
+        Some(other) => anyhow::bail!("unknown provider {other}"),
+    };
+    let dictated = a.text.clone().or_else(|| uc_loop::extract_quoted(&a.goal));
+    let opts = uc_loop::RunOpts {
+        act: a.act,
+        max_steps: a.max_steps,
+        allow_irreversible: a.allow_irreversible,
+        dictated: dictated.clone(),
+        ledger_dir: Some(a.ledger_dir.clone().into()),
+        provider,
+        target_pid: a
+            .hwnd
+            .map(|h| uc_win32::window_pid(uc_win32::HWND(h as *mut core::ffi::c_void))),
+        target_hwnd: a.hwnd,
+    };
+    let mut runner = uc_loop::Runner::new(opts).context("runner init")?;
+    let warm = runner.warm().context("jev warm-up")?;
+    eprintln!(
+        "provider {:?} warm {warm:.0} ms | mode {} | text {}",
+        runner.provider(),
+        if a.act {
+            "ACT"
+        } else {
+            "preview (pass --act to inject)"
+        },
+        dictated
+            .as_deref()
+            .map(|t| format!("„{t}”"))
+            .unwrap_or_else(|| "-".into())
+    );
+    let json_out = a.json;
+    runner.on_step = Some(Box::new(move |rec| {
+        if json_out {
+            println!("{}", serde_json::to_string(rec).unwrap_or_default());
+        } else {
+            println!("{}", format_step(rec));
+        }
+    }));
+    match a.hwnd {
+        Some(h) => {
+            let hwnd = uc_win32::HWND(h as *mut core::ffi::c_void);
+            if !uc_win32::bring_to_front(hwnd) {
+                anyhow::bail!("could not bring hwnd {h} to the front");
+            }
+        }
+        None => countdown(a.delay, "run"),
+    }
+    let summary = runner.run(&a.goal).context("run")?;
+    if json_out {
+        println!("{}", serde_json::to_string(&summary)?);
+    } else {
+        println!(
+            "outcome: {:?} | steps {} | {:.0} ms | jev calls {} | ${:.5}{}",
+            summary.outcome,
+            summary.steps,
+            summary.elapsed_ms,
+            summary.jev_calls,
+            summary.cost_usd,
+            summary
+                .ledger
+                .as_ref()
+                .map(|p| format!(" | ledger {}", p.display()))
+                .unwrap_or_default()
+        );
+    }
+    // 0 = goal reached / preview shown; 2 = stopped (uncertain, blocked, needs text,
+    // budget, focus lost); 3 = the target window is gone (often the goal, not provable).
+    match summary.outcome {
+        uc_loop::Outcome::Done | uc_loop::Outcome::Preview => {}
+        uc_loop::Outcome::TargetGone => std::process::exit(3),
+        _ => std::process::exit(2),
+    }
+    Ok(())
+}
+
+fn describe_action(a: &uc_loop::policy::Action) -> String {
+    use uc_loop::policy::Action;
+    match a {
+        Action::Click {
+            target, name, x, y, ..
+        } => format!("click e{target} {name} @({x},{y})"),
+        Action::Type {
+            text, target_name, ..
+        } => format!(
+            "type „{text}” into {}",
+            target_name.as_deref().unwrap_or("the focused control")
+        ),
+        Action::Key { key } => format!("key {key}"),
+        Action::Scroll { notches, .. } => format!("scroll {notches}"),
+        Action::Wait => "wait".into(),
+    }
+}
+
+fn format_step(r: &uc_loop::StepRecord) -> String {
+    use uc_loop::policy::Verdict;
+    let s = &r.signals;
+    let verdict = match &r.verdict {
+        Verdict::Done => "DONE".to_string(),
+        Verdict::Act { action } => format!(
+            "{}{}",
+            describe_action(action),
+            if r.executed { " ✓" } else { " [preview]" }
+        ),
+        Verdict::Uncertain { reason, .. } => format!("UNCERTAIN: {reason}"),
+        Verdict::NeedsText => "NEEDS TEXT (quote it in the goal or pass --text)".to_string(),
+        Verdict::Blocked { reason } => format!("BLOCKED: {reason}"),
+    };
+    let title: String = r.title.chars().take(40).collect();
+    let changed = match r.changed {
+        None => "",
+        Some(true) => " changed",
+        Some(false) => " NO CHANGE",
+    };
+    format!(
+        "#{:<2} {} „{}”{} | scan {:.0} ms ({}→{}) | jev {:.0} ms{} {} tok | target {} {} {:.2} gap {:.2} H {:.2} | op {} {:.2} key {} {:.2} | goal {:.2} ({:.2}/{:.2}) text {:.2} destr {:.2}\n    → {}",
+        r.step,
+        r.app,
+        title,
+        changed,
+        r.scan_ms,
+        r.raw_elements,
+        r.sent_elements,
+        r.jev_ms,
+        if r.narrowed { " (narrowed ×2)" } else { "" },
+        r.input_tokens,
+        s.target,
+        s.target_name.as_deref().unwrap_or("-"),
+        s.target_conf,
+        s.target_gap,
+        s.target_entropy,
+        s.op,
+        s.op_conf,
+        s.key,
+        s.key_conf,
+        s.goal_reached,
+        s.goal_a,
+        s.goal_pending,
+        s.needs_text,
+        s.is_destructive,
+        verdict
+    )
 }

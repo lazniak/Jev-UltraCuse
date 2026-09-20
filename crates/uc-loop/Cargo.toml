@@ -13,3 +13,5 @@ uc-jev = { path = "../uc-jev" }
 uc-voice = { path = "../uc-voice" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }

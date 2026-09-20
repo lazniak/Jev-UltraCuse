@@ -1187,6 +1187,8 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "thiserror",
+ "tokio",
  "uc-input",
  "uc-jev",
  "uc-uia",
@@ -1239,6 +1241,7 @@ dependencies = [
  "tokio",
  "uc-input",
  "uc-jev",
+ "uc-loop",
  "uc-shell",
  "uc-uia",
  "uc-win32",
