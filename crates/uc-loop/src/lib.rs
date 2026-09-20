@@ -34,8 +34,28 @@ pub mod consts {
     pub const ENTROPY_STRIKES: u32 = 2;
     /// `is_destructive` at or above this blocks the action unless explicitly allowed.
     pub const DESTRUCTIVE_BLOCK: f64 = 0.50;
-    /// Consecutive uncertain verdicts before the run stops and asks for help.
-    pub const UNCERTAIN_STRIKES: u32 = 2;
+    /// Iterative widening on uncertainty (ADR-004), one rung per uncertain step:
+    /// 0 = the window's interactive controls; `WIDEN_CONTEXT` = + labels/static text
+    /// and `WIDEN_MAX_CANDIDATES`; `WIDEN_SURVEY` = a survey of every open window
+    /// (switch, or show the desktop); `WIDEN_TWO` = System Two rescue (when enabled);
+    /// beyond that the run gives up. `target = none` skips straight to the survey.
+    pub const WIDEN_CONTEXT: u8 = 1;
+    pub const WIDEN_SURVEY: u8 = 2;
+    pub const WIDEN_TWO: u8 = 3;
+    pub const WIDEN_MAX_CANDIDATES: usize = 120;
+    /// Foreground changes the loop did not cause (the user keeps taking the mouse
+    /// back) before the run stops.
+    pub const DISPLACED_STRIKES: u32 = 3;
+    /// `Switch` visits per window and run: a second visit allows a round trip (copy
+    /// there, paste back); a third is a ping-pong the survey refuses.
+    pub const SWITCH_MAX_VISITS: u32 = 2;
+    /// Polls (of `SETTLE_CAP_MS`) tolerated with our own window in front before the
+    /// run ends: long enough for the user to reach Stop after restoring the window.
+    pub const OWN_WINDOW_STRIKES: u32 = 10;
+    /// Windows minimized at most to reach the desktop.
+    pub const SHOW_DESKTOP_MAX: usize = 8;
+    /// Windows listed in a survey (front-most first).
+    pub const SURVEY_MAX_WINDOWS: usize = 24;
     /// Consecutive actions with no visible change before the run stops.
     pub const STALL_STRIKES: u32 = 2;
     pub const MAX_STEPS_DEFAULT: usize = 12;
@@ -47,9 +67,13 @@ pub mod consts {
     /// Name of the synthetic element that stands for an empty spot of the target
     /// window: the only way to say "right-click the background" (desktop → New…).
     pub const BACKGROUND_NAME: &str = "background (empty area)";
-    /// Caption / tab strip height skipped when looking for an empty spot, px.
+    /// Caption / tab strip height skipped when looking for an empty spot, px at
+    /// 96 DPI (scaled by the window's DPI; the process is per-monitor aware).
     pub const BACKGROUND_TOP_SKIP: i32 = 48;
+    /// Margin kept from the window edges (resize frame) and the halo around every
+    /// element, px at 96 DPI.
     pub const BACKGROUND_MARGIN: i32 = 16;
+    pub const BACKGROUND_HALO: i32 = 12;
     /// System Two (OpenRouter chat model) consultations per run: one plan + rescues.
     pub const TWO_MAX_CALLS: u32 = 3;
     /// How long the loop waits for a rescue when Jev is stuck (kill switch and stop
@@ -156,6 +180,12 @@ pub mod consts {
         pub const NEEDS_TEXT_TRUE: &str =
             "A text field must receive content before `goal` can advance.";
         pub const NEEDS_TEXT_FALSE: &str = "No typing is needed for the next step.";
+        pub const PLACE: &str = "In which of `windows` should the work toward `goal` continue? `current` is the window in front now; `last` says what was just done.";
+        pub const PLACE_DESKTOP: &str = "The desktop itself (its icons and background) — every open window is in the way and should be minimized.";
+        pub const PLACE_DESKTOP_HERE: &str =
+            "The desktop itself, which is in front now: stay here.";
+        pub const PLACE_NONE: &str =
+            "No open window fits `goal`; the application needed is not running.";
         pub const DESTRUCTIVE: &str = "Would the most likely next action delete data, send a message, pay, or otherwise be hard to undo?";
         pub const DESTRUCTIVE_TRUE: &str = "The next action is irreversible or destructive.";
         pub const DESTRUCTIVE_FALSE: &str = "The next action is safe and reversible.";
@@ -263,6 +293,15 @@ pub mod policy {
             at: Option<(i32, i32)>,
         },
         Wait,
+        /// Bring another open window to the front (a survey decision). No input is
+        /// injected: `SetForegroundWindow`.
+        Switch {
+            hwnd: isize,
+            title: String,
+            exe: String,
+        },
+        /// Minimize whatever covers the desktop, then work there (a survey decision).
+        ShowDesktop,
     }
 
     #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -405,6 +444,14 @@ pub mod policy {
             return unsure(format!("op {} at {:.2} < {CONF_FLOOR}", s.op, s.op_conf));
         }
         let target_el = parse_target(&s.target).and_then(|i| find(els, i));
+        // The synthetic background stands for a spot to (right-)click; typing or
+        // scrolling "at" it would land on whatever is really there. (`key` and `wait`
+        // do not use the target, so they pass.)
+        if target_el.is_some_and(|e| e.name == BACKGROUND_NAME)
+            && matches!(s.op.as_str(), "type" | "scroll_up" | "scroll_down")
+        {
+            return unsure(format!("op {} on the background", s.op));
+        }
         let (target_conf, target_gap) = (s.target_conf, s.target_gap);
         let target_ok = target_el.is_some_and(|e| e.enabled)
             && target_conf >= CONF_FLOOR
@@ -624,6 +671,187 @@ pub mod policy {
     }
 }
 
+// ------------------------------------------------------------------ survey
+
+/// The window survey (widening rung `WIDEN_SURVEY`, and every displacement): one cheap
+/// Jev call over the titles of the open windows — no UIA — answering "where should the
+/// work go on?". The desktop is its own option, because reaching it means minimizing
+/// what covers it, not activating Explorer's hidden window.
+pub mod survey {
+    use super::consts::{q, CONF_FLOOR, SWITCH_MAX_VISITS, TOP2_GAP_MIN};
+    use serde_json::{json, Value};
+    use uc_win32::WindowInfo;
+
+    #[derive(Clone, Debug, PartialEq)]
+    pub enum Choice {
+        /// The window in front is the right place.
+        Stay,
+        Switch(WindowInfo),
+        Desktop,
+        /// No open window fits.
+        Nothing(String),
+        /// Jev could not tell.
+        Unsure(String),
+    }
+
+    /// The window in front when the survey is asked.
+    #[derive(Clone, Copy, Debug)]
+    pub struct Current<'a> {
+        pub hwnd: isize,
+        pub app: &'a str,
+        pub title: &'a str,
+        /// The user moved the foreground here; the loop did not.
+        pub displaced: bool,
+        /// `Progman`/`WorkerW` in front: "desktop" means stay.
+        pub on_desktop: bool,
+    }
+
+    /// State + question over the switchable windows (the desktop excluded from the
+    /// list, present as the `desktop` option). Returns the candidate list the ids refer to.
+    pub fn build(
+        goal: &str,
+        windows: &[WindowInfo],
+        current: &Current<'_>,
+        last: Option<Value>,
+    ) -> (Value, uc_jev::Compiled, Vec<WindowInfo>) {
+        let Current {
+            hwnd: current_hwnd,
+            app: current_app,
+            title: current_title,
+            displaced,
+            on_desktop,
+        } = *current;
+        let candidates: Vec<WindowInfo> = windows
+            .iter()
+            .filter(|w| !w.is_desktop())
+            .cloned()
+            .collect();
+        let list: Vec<Value> = candidates
+            .iter()
+            .enumerate()
+            .map(|(i, w)| {
+                json!({
+                    "id": format!("w{i}"),
+                    "title": w.title,
+                    "exe": w.exe,
+                    "minimized": w.minimized,
+                    "in_front": w.hwnd == current_hwnd,
+                })
+            })
+            .collect();
+        let mut state = json!({
+            "goal": goal,
+            "current": {
+                "app": current_app,
+                "title": current_title,
+                "displaced_by_user": displaced,
+                "is_desktop": on_desktop,
+            },
+            "windows": list,
+        });
+        if let Some(l) = last {
+            state["last"] = l;
+        }
+        let mut criteria: Vec<(String, String)> = candidates
+            .iter()
+            .enumerate()
+            .map(|(i, w)| {
+                (
+                    format!("w{i}"),
+                    format!(
+                        "„{}” ({}){}{}",
+                        w.title,
+                        w.exe,
+                        if w.minimized { ", minimized" } else { "" },
+                        if w.hwnd == current_hwnd {
+                            ", in front now"
+                        } else {
+                            ""
+                        }
+                    ),
+                )
+            })
+            .collect();
+        criteria.push((
+            "desktop".into(),
+            if on_desktop {
+                q::PLACE_DESKTOP_HERE.into()
+            } else {
+                q::PLACE_DESKTOP.into()
+            },
+        ));
+        criteria.push(("none".into(), q::PLACE_NONE.into()));
+        let pairs: Vec<(&str, String)> = criteria
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.clone()))
+            .collect();
+        let mut qs = serde_json::Map::new();
+        qs.insert("place".into(), uc_jev::choice(q::PLACE, &pairs));
+        (state, uc_jev::Compiled::new(&qs), candidates)
+    }
+
+    /// Floors: the winner's probability ≥ `CONF_FLOOR` and top-2 gap ≥ `TOP2_GAP_MIN`.
+    /// (The element gate uses the model's `confidence` ≈ top-2 margin against the same
+    /// floor, which is stricter; with twenty windows a margin floor would starve the
+    /// survey.) `exhausted`: windows switched to `SWITCH_MAX_VISITS` times already (0 =
+    /// the desktop) — choosing one again is a ping-pong, reported as unsure so the
+    /// ladder moves on.
+    pub fn judge(
+        d: &uc_jev::Decision,
+        candidates: &[WindowInfo],
+        current_hwnd: isize,
+        on_desktop: bool,
+        exhausted: &[isize],
+    ) -> (Choice, Value) {
+        let by_id = |id: &str| {
+            id.strip_prefix('w')
+                .and_then(|n| n.parse::<usize>().ok())
+                .and_then(|i| candidates.get(i))
+        };
+        let top = d.top("place", 3);
+        // The ids mean nothing after the step: keep the titles next to them.
+        let labelled: Vec<Value> = top
+            .iter()
+            .map(|(id, p)| {
+                let label = by_id(id)
+                    .map(|w| format!("{} ({})", w.title, w.exe))
+                    .unwrap_or_else(|| id.clone());
+                json!([id, p, label])
+            })
+            .collect();
+        let note = json!({"top": labelled});
+        let Some((id, p)) = top.first().cloned() else {
+            return (Choice::Unsure("survey: no answer".into()), note);
+        };
+        let id = id.as_str();
+        let gap = d.top2_gap("place").unwrap_or(p);
+        if p < CONF_FLOOR || gap < TOP2_GAP_MIN {
+            return (
+                Choice::Unsure(format!("survey: {id} at {p:.2}, gap {gap:.2}")),
+                note,
+            );
+        }
+        let choice = match id {
+            "desktop" if on_desktop => Choice::Stay,
+            "desktop" if exhausted.contains(&0) => Choice::Unsure(format!(
+                "survey: the desktop was shown {SWITCH_MAX_VISITS}× already"
+            )),
+            "desktop" => Choice::Desktop,
+            "none" => Choice::Nothing("survey: no open window fits the goal".into()),
+            w => match by_id(w) {
+                Some(win) if win.hwnd == current_hwnd => Choice::Stay,
+                Some(win) if exhausted.contains(&win.hwnd) => Choice::Unsure(format!(
+                    "survey: „{}” was switched to {SWITCH_MAX_VISITS}× already",
+                    win.title
+                )),
+                Some(win) => Choice::Switch(win.clone()),
+                None => Choice::Unsure(format!("survey: unknown window {w}")),
+            },
+        };
+        (choice, note)
+    }
+}
+
 // ------------------------------------------------------------------ exec
 
 pub mod exec {
@@ -631,14 +859,34 @@ pub mod exec {
 
     use uc_input::Button;
 
-    use crate::consts::{FOCUS_SETTLE_MS, WAIT_MS};
+    use crate::consts::{FOCUS_SETTLE_MS, SHOW_DESKTOP_MAX, WAIT_MS};
     use crate::policy::Action;
+    use crate::{hwnd_of, LoopError};
 
     /// Inject one action. Every branch is a single `SendInput` batch (plus a clipboard
     /// paste for long text); no allocation happens between the call and the syscall
     /// beyond what `uc-input` already does.
-    pub fn perform(a: &Action) -> Result<(), uc_input::InputError> {
+    pub fn perform(a: &Action) -> Result<Vec<String>, LoopError> {
         match a {
+            Action::Switch { hwnd, title, .. } => {
+                if !uc_win32::bring_to_front(hwnd_of(*hwnd)) {
+                    return Err(LoopError::Window(format!(
+                        "could not bring „{title}” to the front"
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(FOCUS_SETTLE_MS));
+            }
+            Action::ShowDesktop => {
+                let minimized = uc_win32::show_desktop(SHOW_DESKTOP_MAX);
+                std::thread::sleep(Duration::from_millis(FOCUS_SETTLE_MS));
+                // `Progman`/`WorkerW` only: the taskbar in front is not the desktop.
+                let on_desktop = uc_win32::foreground_hwnd()
+                    .is_some_and(|h| uc_win32::is_desktop_class(&uc_win32::window_class(h)));
+                if !on_desktop {
+                    return Err(LoopError::Window("could not reach the desktop".into()));
+                }
+                return Ok(minimized);
+            }
             Action::Click { x, y, right, .. } => {
                 uc_input::click(*x, *y, if *right { Button::Right } else { Button::Left }, 1)?;
             }
@@ -662,7 +910,7 @@ pub mod exec {
             }
             Action::Wait => std::thread::sleep(Duration::from_millis(WAIT_MS)),
         }
-        Ok(())
+        Ok(Vec::new())
     }
 }
 
@@ -761,6 +1009,8 @@ pub enum LoopError {
     Json(#[from] serde_json::Error),
     #[error("System Two: {0}")]
     Two(String),
+    #[error("window: {0}")]
+    Window(String),
 }
 
 /// One step's view of the target: the foreground window plus its pop-ups, reduced.
@@ -814,8 +1064,18 @@ pub fn perceive(
     );
     // The background is a target too (context menu of the desktop or of an empty
     // canvas); UIA has no element for it, so one is synthesised at a free spot of the
-    // main window — after `reduce`, so the candidate cap never drops it.
-    if let Some((x, y)) = empty_spot(scene.rect, &reduced) {
+    // main window — after `reduce`, so the candidate cap never drops it, but checked
+    // against *every* scanned element (the cap hides most of a busy window), inside
+    // the monitor's work area (the desktop window runs under the taskbar).
+    // No monitor info: trust the window rect; no overlap with the work area: the window
+    // is off every monitor, so there is no background to click.
+    let area = match uc_win32::work_area_of(scene.hwnd()) {
+        Some(wa) => uc_win32::rect_intersect(scene.rect, wa),
+        None => Some(scene.rect),
+    };
+    if let Some((x, y)) =
+        area.and_then(|a| empty_spot(a, &scan.elements, uc_win32::dpi_of(scene.hwnd())))
+    {
         reduced.push(uc_uia::Element {
             i: reduced.len(),
             role: "pane".into(),
@@ -837,34 +1097,39 @@ pub fn perceive(
 /// A point inside `rect` (below the caption, inside the margins) that no element
 /// covers — the centre first, then a coarse grid ordered by distance from the centre.
 /// `None` when the window is fully covered (a maximised document, a list view).
-pub fn empty_spot(rect: uc_win32::Rect, els: &[uc_uia::Element]) -> Option<(i32, i32)> {
+/// `dpi` scales the 96-DPI constants (caption, margin, halo, grid step).
+pub fn empty_spot(rect: uc_win32::Rect, els: &[uc_uia::Element], dpi: u32) -> Option<(i32, i32)> {
+    let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
+    let px = |v: i32| (v as f32 * scale).round() as i32;
     let [rx, ry, rw, rh] = rect;
-    let m = consts::BACKGROUND_MARGIN;
-    let (x0, y0) = (rx + m, ry + consts::BACKGROUND_TOP_SKIP);
+    let m = px(consts::BACKGROUND_MARGIN);
+    let (x0, y0) = (rx + m, ry + px(consts::BACKGROUND_TOP_SKIP));
     let (x1, y1) = (rx + rw - m, ry + rh - m);
     if x1 <= x0 || y1 <= y0 {
         return None;
     }
+    let halo = px(consts::BACKGROUND_HALO);
     let covered = |x: i32, y: i32| {
         els.iter().any(|e| {
             let [ex, ey, ew, eh] = e.bbox;
-            x >= ex - 12 && x < ex + ew + 12 && y >= ey - 12 && y < ey + eh + 12
+            x >= ex - halo && x < ex + ew + halo && y >= ey - halo && y < ey + eh + halo
         })
     };
     let (cx, cy) = ((x0 + x1) / 2, (y0 + y1) / 2);
     if !covered(cx, cy) {
         return Some((cx, cy));
     }
-    let step = ((x1 - x0) / 12).max(48);
+    let step_x = ((x1 - x0) / 12).max(px(48));
+    let step_y = ((y1 - y0) / 12).max(px(48));
     let mut grid: Vec<(i32, i32)> = Vec::new();
     let mut y = y0;
     while y < y1 {
         let mut x = x0;
         while x < x1 {
             grid.push((x, y));
-            x += step;
+            x += step_x;
         }
-        y += step;
+        y += step_y;
     }
     grid.sort_by_key(|(x, y)| (x - cx).abs() + (y - cy).abs());
     grid.into_iter().find(|&(x, y)| !covered(x, y))
@@ -882,12 +1147,10 @@ pub struct RunOpts {
     pub ledger_dir: Option<PathBuf>,
     /// `None` = discover (vendor first).
     pub provider: Option<uc_jev::Provider>,
-    /// Only act while this process owns the foreground window (`None` = lock onto
-    /// whatever is in front at the first step). Dialogs of the same process pass.
-    pub target_pid: Option<u32>,
-    /// The window the run started on (`None` = the foreground window at step 1);
-    /// when it stops existing the run ends with [`Outcome::TargetGone`].
-    pub target_hwnd: Option<isize>,
+    /// Where the work starts: this window is brought to the front and adopted as the
+    /// place (`None` = the foreground window at step 1). From there the loop follows
+    /// its own actions — dialogs, new windows, a survey's switch, the desktop.
+    pub start_hwnd: Option<isize>,
     /// Cooperative stop from another thread (a Stop button); checked wherever the
     /// kill switch is.
     pub stop: Option<Arc<AtomicBool>>,
@@ -905,8 +1168,7 @@ impl Default for RunOpts {
             dictated: None,
             ledger_dir: None,
             provider: None,
-            target_pid: None,
-            target_hwnd: None,
+            start_hwnd: None,
             stop: None,
             two: None,
         }
@@ -924,9 +1186,20 @@ pub struct StepRecord {
     /// Pop-up windows of the target process (menus, drop-downs, dialogs) merged into
     /// the scan.
     pub popups: usize,
+    /// Widening rung this step was perceived at (`consts::WIDEN_*`; 0 = plain).
+    pub widen: u8,
+    /// A window survey ran this step (displacement or rung `WIDEN_SURVEY`): top-3.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub survey: Option<Value>,
     /// The sub-goal Jev was asked about (`k/n: text`) when a System Two plan is active.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subgoal: Option<String>,
+    /// Titles a `ShowDesktop` step minimized, front first.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub minimized: Vec<String>,
+    /// The window manager refused the step's action; nothing changed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
     /// System Two consultations applied or received during this step.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub two: Vec<uc_two::Note>,
@@ -967,11 +1240,11 @@ pub enum Outcome {
     Killed,
     /// The caller asked to stop (`RunOpts::stop`).
     Stopped,
-    /// Another process took the foreground; nothing was injected into it.
+    /// Someone else kept moving the foreground (`DISPLACED_STRIKES`); nothing was
+    /// injected into those windows.
     FocusLost(String),
-    /// The window the run started on no longer exists (closed by the last action or
-    /// by someone else); code cannot tell whether that was the goal, so it is reported
-    /// neutrally and the caller decides.
+    /// The place's window vanished without an action of the loop (closed by someone
+    /// else); reported neutrally, the caller decides.
     TargetGone,
 }
 
@@ -1035,10 +1308,6 @@ impl Runner {
         self.client.provider()
     }
 
-    fn stop_requested(&self) -> bool {
-        stop_set(&self.opts.stop)
-    }
-
     /// System Two's model id, when enabled.
     pub fn two_model(&self) -> Option<&str> {
         self.two.as_ref().map(|t| t.model())
@@ -1063,7 +1332,6 @@ impl Runner {
         let mut plan_i = 0usize;
         let mut last: Option<Value> = None;
         let mut last_hash: Option<u64> = None;
-        let mut uncertain = 0u32;
         let mut entropy_strikes = 0u32;
         let mut stall = 0u32;
         let mut waits = 0u32;
@@ -1071,8 +1339,23 @@ impl Runner {
         let mut steps = 0usize;
         let mut jev_calls = 0u64;
         let mut cost = 0.0f64;
-        let mut locked_pid = self.opts.target_pid;
-        let mut target_hwnd = self.opts.target_hwnd;
+        // Where the work happens (ADR-004): the caller's `start_hwnd` or the foreground
+        // at step 1, then wherever the loop's own actions lead (dialogs, windows it
+        // opened, a survey's switch, the desktop). A change of process the loop did
+        // not cause is a displacement: nothing is injected there; a survey decides.
+        let mut place_hwnd = self.opts.start_hwnd;
+        let mut place_pid: Option<u32> = place_hwnd
+            .map(|h| uc_win32::window_pid(hwnd_of(h)))
+            .filter(|p| *p != 0);
+        let mut expect_change = false;
+        let mut displaced = 0u32;
+        // Widening rung for the coming step (0 = plain; `consts::WIDEN_*`).
+        let mut widen: u8 = 0;
+        let mut survey_only = false;
+        // `Switch` targets and how often: a round trip is fine, a ping-pong is not.
+        let mut visits: std::collections::HashMap<isize, u32> = Default::default();
+        let own_pid = std::process::id();
+        let mut own_strikes = 0u32;
 
         let outcome = loop {
             if steps >= self.opts.max_steps {
@@ -1081,41 +1364,111 @@ impl Runner {
             if uc_win32::kill_switch_pressed() {
                 break Outcome::Killed;
             }
-            if self.stop_requested() {
+            if stop_set(&stop_flag) {
                 break Outcome::Stopped;
             }
-            steps += 1;
             let t0 = Instant::now();
 
             // 1. Perceive: coarse scene in µs, UIA tree in ms (the app's provider decides).
             let scene = uc_win32::scene().ok_or(LoopError::NoForeground)?;
-            if let Some(h) = target_hwnd {
-                if !uc_win32::is_window(uc_win32::HWND(h as *mut core::ffi::c_void)) {
-                    break Outcome::TargetGone;
+            if scene.pid == own_pid {
+                // Our own window in front (the GUI not yet minimized, or restored by the
+                // user): never the place — AccessKit would offer our own Start/Stop to
+                // Jev. Not a step: wait, and give up when it stays.
+                own_strikes += 1;
+                if own_strikes >= consts::OWN_WINDOW_STRIKES {
+                    break Outcome::FocusLost("own window in front".into());
                 }
-            } else {
-                target_hwnd = Some(scene.hwnd);
+                std::thread::sleep(Duration::from_millis(consts::SETTLE_CAP_MS));
+                continue;
             }
-            match locked_pid {
-                None => locked_pid = Some(scene.pid),
-                Some(pid) if pid != scene.pid => {
-                    break Outcome::FocusLost(format!(
-                        "foreground is now {} (pid {}), locked on pid {pid}",
-                        scene.app, scene.pid
-                    ));
+            own_strikes = 0;
+            steps += 1;
+            let mut displaced_now = false;
+            match (place_hwnd, place_pid) {
+                (Some(h), Some(pid)) if scene.pid != pid => {
+                    let alive = uc_win32::is_window(hwnd_of(h));
+                    if expect_change {
+                        // Our own action opened, closed or switched something: follow it.
+                        if let Some(l) = last.as_mut() {
+                            l["effect"] = json!(format!(
+                                "focus moved to {} „{}”{}",
+                                scene.app,
+                                scene.title,
+                                if alive {
+                                    ""
+                                } else {
+                                    "; the previous window is gone"
+                                }
+                            ));
+                        }
+                        place_hwnd = Some(scene.hwnd);
+                        place_pid = Some(scene.pid);
+                        last_hash = None;
+                    } else if !alive {
+                        break Outcome::TargetGone;
+                    } else {
+                        displaced += 1;
+                        if displaced >= consts::DISPLACED_STRIKES {
+                            break Outcome::FocusLost(format!(
+                                "foreground moved to {} (pid {}) {displaced}× without the loop's doing",
+                                scene.app, scene.pid
+                            ));
+                        }
+                        // Not our window: no element decision, no injection — only the
+                        // survey may say "continue here", "go back" or "desktop".
+                        displaced_now = true;
+                        survey_only = true;
+                    }
                 }
-                Some(_) => {}
+                // A dialog or another window of the same app: the place moves with it.
+                (Some(_), Some(_)) => {
+                    place_hwnd = Some(scene.hwnd);
+                    displaced = 0;
+                }
+                _ => {
+                    place_hwnd = Some(scene.hwnd);
+                    place_pid = Some(scene.pid);
+                    displaced = 0;
+                }
             }
+            expect_change = false;
+            let survey_step = survey_only;
+            let include_context = widen >= consts::WIDEN_CONTEXT;
+            // A survey step asks about windows, not elements: no UIA scan (titles and
+            // exes are all that leaves the machine), and the window the user moved to
+            // is not inspected.
             let Perception {
                 scan,
                 reduced,
                 popups,
-            } = perceive(&self.scanner, &scene, false, consts::MAX_CANDIDATES);
+            } = if survey_step {
+                Perception {
+                    scan: uc_uia::Scan::default(),
+                    reduced: Vec::new(),
+                    popups: 0,
+                }
+            } else {
+                perceive(
+                    &self.scanner,
+                    &scene,
+                    include_context,
+                    if include_context {
+                        consts::WIDEN_MAX_CANDIDATES
+                    } else {
+                        consts::MAX_CANDIDATES
+                    },
+                )
+            };
             let hash = uc_uia::tree_hash(&reduced);
             let scan_ms = ms(t0);
 
             // 2. Did the last action change anything? Code compares states, not Jev.
-            let changed = last_hash.map(|h| h != hash);
+            let changed = if survey_step {
+                None
+            } else {
+                last_hash.map(|h| h != hash)
+            };
             match changed {
                 Some(false) => {
                     if !last_was_wait {
@@ -1137,7 +1490,8 @@ impl Runner {
                 break Outcome::Stalled;
             }
 
-            // 3. Decide: one request, six questions.
+            // 3. Decide: one request, seven questions — or, on a survey step, one
+            //    question over the open windows.
             let goal_now: String = plan
                 .as_ref()
                 .map(|p| p[plan_i].clone())
@@ -1145,250 +1499,345 @@ impl Runner {
             let subgoal_label = plan
                 .as_ref()
                 .map(|p| format!("{}/{}: {}", plan_i + 1, p.len(), p[plan_i]));
-            let state = uc_uia::GuiState {
-                goal: &goal_now,
-                scene: &scene,
-                elements: &reduced,
-                last: last.clone(),
-                dictated: dictated.as_deref(),
-                plan: plan
-                    .as_ref()
-                    .map(|p| json!({"overall": goal, "steps": p, "current": plan_i})),
-            };
-            let est_tokens = state.estimate_tokens();
-            let state_bytes = serde_json::to_vec(&state)?;
-            // System Two, between the lines: the plan request goes out with the first
-            // state and is never waited for; the loop keeps deciding with Jev.
-            if steps == 1 {
-                if let Some(two) = self.two.as_mut() {
-                    two.ask(uc_two::Request {
-                        kind: uc_two::Kind::Plan,
-                        tag: steps as u64,
-                        goal: goal.to_string(),
-                        subgoal: None,
-                        state: serde_json::from_slice(&state_bytes)?,
-                        jev: None,
-                        why: None,
-                        need_text: dictated.is_none(),
-                    });
-                }
-            }
-            let compiled = questions::compile(&reduced);
-            let t_jev = Instant::now();
-            let decision = self
-                .rt
-                .block_on(self.client.decide(&state_bytes, &compiled))?;
-            let mut jev_ms = ms(t_jev);
-            jev_calls += 1;
-            cost += decision.cost_usd;
-
-            // 4. Gate in code — and on a close call between listed candidates, ask once
-            //    more over the top two only (shortlist pattern), still inside this step.
-            let mut step_tokens = decision.usage.input_tokens;
-            let mut step_cost = decision.cost_usd;
-            let mut signals = policy::Signals::from_decision(&decision, &reduced);
-            let mut verdict = policy::judge(
-                &signals,
-                &reduced,
-                dictated.as_deref(),
-                self.opts.allow_irreversible,
-            );
-            let mut narrowed = false;
-            let mut signals_first: Option<policy::Signals> = None;
-            if let policy::Verdict::Uncertain {
-                narrow: Some(ids), ..
-            } = &verdict
-            {
-                let mut q = serde_json::Map::new();
-                for id in ids {
-                    if let Some(el) =
-                        policy::parse_target(id).and_then(|i| policy::find(&reduced, i))
-                    {
-                        q.insert(
-                            format!("ok_{id}"),
-                            uc_jev::noul(
-                                &format!(
-                                    "{} {} ({id})",
-                                    consts::q::OK_PREFIX,
-                                    policy::describe(el)
-                                ),
-                                consts::q::OK_TRUE,
-                                consts::q::OK_FALSE,
-                            ),
-                        );
-                    }
-                }
-                let compiled2 = uc_jev::Compiled::new(&q);
-                let t2 = Instant::now();
-                let d2 = self
-                    .rt
-                    .block_on(self.client.decide(&state_bytes, &compiled2))?;
-                jev_ms += ms(t2);
-                jev_calls += 1;
-                cost += d2.cost_usd;
-                step_tokens += d2.usage.input_tokens;
-                step_cost += d2.cost_usd;
-                let mut scored: Vec<(String, f64)> = ids
-                    .iter()
-                    .map(|id| (id.clone(), d2.noul(&format!("ok_{id}")).unwrap_or(0.0)))
-                    .collect();
-                scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                let mut gated = signals.clone();
-                if let Some((id, p)) = scored.first() {
-                    gated.target = id.clone();
-                    gated.target_conf = *p;
-                    // Resolved by independent gates, not by a margin between them.
-                    gated.target_gap = 1.0;
-                    gated.target_entropy = 0.0;
-                    gated.target_name = policy::parse_target(id)
-                        .and_then(|i| policy::find(&reduced, i))
-                        .map(policy::describe);
-                    gated.target_top = scored.clone();
-                }
-                signals_first = Some(std::mem::replace(&mut signals, gated));
-                verdict = policy::judge(
-                    &signals,
-                    &reduced,
-                    dictated.as_deref(),
-                    self.opts.allow_irreversible,
-                );
-                narrowed = true;
-            }
-
-            // 4b. System Two, between the lines: fold in whatever arrived meanwhile (a
-            //     plan, text — a late rescue's `next` is stale and never executed);
-            //     when Jev is stuck, or needs text nobody dictated, ask for a rescue and
-            //     wait for *that* reply, since the step would otherwise end empty anyway.
+            let step_widen = widen;
             let mut two_notes: Vec<uc_two::Note> = Vec::new();
             let mut two_outcome: Option<Outcome> = None;
             let mut two_decided = false;
-            if let Some(two) = self.two.as_mut() {
-                while let Some(reply) = two.try_recv() {
-                    two_notes.push(apply_reply(
-                        &reply,
-                        goal,
-                        &mut plan,
-                        &mut plan_i,
-                        &mut dictated,
-                        false,
-                    ));
+            let mut survey_note: Option<Value> = None;
+            let mut adopt_here = false;
+            let (
+                signals,
+                verdict,
+                step_tokens,
+                step_cost,
+                jev_ms,
+                narrowed,
+                signals_first,
+                hedged_winner,
+                est_tokens,
+            ) = if survey_only {
+                survey_only = false;
+                let t_jev = Instant::now();
+                let mut windows = uc_win32::list_windows();
+                windows.truncate(consts::SURVEY_MAX_WINDOWS);
+                let on_desktop =
+                    uc_win32::is_desktop_class(&uc_win32::window_class(hwnd_of(scene.hwnd)));
+                let (state, compiled, candidates) = survey::build(
+                    &goal_now,
+                    &windows,
+                    &survey::Current {
+                        hwnd: scene.hwnd,
+                        app: &scene.app,
+                        title: &scene.title,
+                        displaced: displaced_now,
+                        on_desktop,
+                    },
+                    last.clone(),
+                );
+                let bytes = serde_json::to_vec(&state)?;
+                let d = self.rt.block_on(self.client.decide(&bytes, &compiled))?;
+                jev_calls += 1;
+                cost += d.cost_usd;
+                let (choice, note) = {
+                    let exhausted: Vec<isize> = visits
+                        .iter()
+                        .filter(|(_, n)| **n >= consts::SWITCH_MAX_VISITS)
+                        .map(|(h, _)| *h)
+                        .collect();
+                    survey::judge(&d, &candidates, scene.hwnd, on_desktop, &exhausted)
+                };
+                survey_note = Some(note);
+                let verdict = match choice {
+                    survey::Choice::Stay => {
+                        adopt_here = displaced_now;
+                        policy::Verdict::Uncertain {
+                            reason: "survey: the window in front is the right place".into(),
+                            narrow: None,
+                        }
+                    }
+                    survey::Choice::Switch(w) => policy::Verdict::Act {
+                        action: policy::Action::Switch {
+                            hwnd: w.hwnd,
+                            title: w.title,
+                            exe: w.exe,
+                        },
+                    },
+                    survey::Choice::Desktop => policy::Verdict::Act {
+                        action: policy::Action::ShowDesktop,
+                    },
+                    survey::Choice::Nothing(r) | survey::Choice::Unsure(r) => {
+                        policy::Verdict::Uncertain {
+                            reason: r,
+                            narrow: None,
+                        }
+                    }
+                };
+                (
+                    policy::Signals {
+                        op: "survey".into(),
+                        target: "none".into(),
+                        ..Default::default()
+                    },
+                    verdict,
+                    d.usage.input_tokens,
+                    d.cost_usd,
+                    ms(t_jev),
+                    false,
+                    None,
+                    d.timing.winner,
+                    bytes.len() / 4,
+                )
+            } else {
+                let state = uc_uia::GuiState {
+                    goal: &goal_now,
+                    scene: &scene,
+                    elements: &reduced,
+                    last: last.clone(),
+                    dictated: dictated.as_deref(),
+                    plan: plan
+                        .as_ref()
+                        .map(|p| json!({"overall": goal, "steps": p, "current": plan_i})),
+                };
+                let est_tokens = state.estimate_tokens();
+                let state_bytes = serde_json::to_vec(&state)?;
+                // System Two, between the lines: the plan request goes out with the first
+                // state and is never waited for; the loop keeps deciding with Jev.
+                if steps == 1 {
+                    if let Some(two) = self.two.as_mut() {
+                        two.ask(uc_two::Request {
+                            kind: uc_two::Kind::Plan,
+                            tag: steps as u64,
+                            goal: goal.to_string(),
+                            subgoal: None,
+                            state: serde_json::from_slice(&state_bytes)?,
+                            jev: None,
+                            why: None,
+                            need_text: dictated.is_none(),
+                        });
+                    }
                 }
-                let needs_text = matches!(verdict, policy::Verdict::NeedsText);
-                let stuck = matches!(verdict, policy::Verdict::Uncertain { .. })
-                    || (needs_text && dictated.is_none());
-                if stuck && two.remaining() > 0 {
-                    let why = match &verdict {
-                        policy::Verdict::Uncertain { reason, .. } => reason.clone(),
-                        _ => "the goal needs text and none was dictated".to_string(),
-                    };
-                    let tag = steps as u64;
-                    let asked = two.ask(uc_two::Request {
-                        kind: uc_two::Kind::Rescue,
-                        tag,
-                        goal: goal.to_string(),
-                        subgoal: plan.as_ref().map(|p| p[plan_i].clone()),
-                        state: serde_json::from_slice(&state_bytes)?,
-                        jev: Some(json!({
-                            "target_top": signals.target_top,
-                            "op": signals.op,
-                            "op_conf": signals.op_conf,
-                            "goal_reached": signals.goal_reached,
-                            "needs_text": signals.needs_text,
-                        })),
-                        why: Some(why),
-                        need_text: needs_text || signals.needs_text >= 0.5,
-                    });
-                    if asked {
-                        let t_wait = Instant::now();
-                        let deadline = t_wait + Duration::from_millis(consts::TWO_WAIT_MS);
-                        let mut reply = None;
-                        while Instant::now() < deadline {
-                            if uc_win32::kill_switch_pressed() {
-                                two_outcome = Some(Outcome::Killed);
-                                break;
-                            }
-                            if stop_set(&stop_flag) {
-                                two_outcome = Some(Outcome::Stopped);
-                                break;
-                            }
-                            match two.wait(Duration::from_millis(100)) {
-                                uc_two::Wait::Reply(r)
-                                    if r.kind == uc_two::Kind::Rescue && r.tag == tag =>
-                                {
-                                    reply = Some(r);
+                let compiled = questions::compile(&reduced);
+                let t_jev = Instant::now();
+                let decision = self
+                    .rt
+                    .block_on(self.client.decide(&state_bytes, &compiled))?;
+                let mut jev_ms = ms(t_jev);
+                jev_calls += 1;
+                cost += decision.cost_usd;
+
+                // 4. Gate in code — and on a close call between listed candidates, ask
+                //    once more over the top two only (shortlist), still inside this step.
+                let mut step_tokens = decision.usage.input_tokens;
+                let mut step_cost = decision.cost_usd;
+                let mut signals = policy::Signals::from_decision(&decision, &reduced);
+                let mut verdict =
+                    policy::judge(&signals, &reduced, dictated.as_deref(), allow_irreversible);
+                let mut narrowed = false;
+                let mut signals_first: Option<policy::Signals> = None;
+                if let policy::Verdict::Uncertain {
+                    narrow: Some(ids), ..
+                } = &verdict
+                {
+                    let mut q = serde_json::Map::new();
+                    for id in ids {
+                        if let Some(el) =
+                            policy::parse_target(id).and_then(|i| policy::find(&reduced, i))
+                        {
+                            q.insert(
+                                format!("ok_{id}"),
+                                uc_jev::noul(
+                                    &format!(
+                                        "{} {} ({id})",
+                                        consts::q::OK_PREFIX,
+                                        policy::describe(el)
+                                    ),
+                                    consts::q::OK_TRUE,
+                                    consts::q::OK_FALSE,
+                                ),
+                            );
+                        }
+                    }
+                    let compiled2 = uc_jev::Compiled::new(&q);
+                    let t2 = Instant::now();
+                    let d2 = self
+                        .rt
+                        .block_on(self.client.decide(&state_bytes, &compiled2))?;
+                    jev_ms += ms(t2);
+                    jev_calls += 1;
+                    cost += d2.cost_usd;
+                    step_tokens += d2.usage.input_tokens;
+                    step_cost += d2.cost_usd;
+                    let mut scored: Vec<(String, f64)> = ids
+                        .iter()
+                        .map(|id| (id.clone(), d2.noul(&format!("ok_{id}")).unwrap_or(0.0)))
+                        .collect();
+                    scored
+                        .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    let mut gated = signals.clone();
+                    if let Some((id, p)) = scored.first() {
+                        gated.target = id.clone();
+                        gated.target_conf = *p;
+                        // Resolved by independent gates, not by a margin between them.
+                        gated.target_gap = 1.0;
+                        gated.target_entropy = 0.0;
+                        gated.target_name = policy::parse_target(id)
+                            .and_then(|i| policy::find(&reduced, i))
+                            .map(policy::describe);
+                        gated.target_top = scored.clone();
+                    }
+                    signals_first = Some(std::mem::replace(&mut signals, gated));
+                    verdict =
+                        policy::judge(&signals, &reduced, dictated.as_deref(), allow_irreversible);
+                    narrowed = true;
+                }
+
+                // 4b. System Two, between the lines: fold in whatever arrived meanwhile
+                //     (a plan, text — a late rescue's `next` is stale and never
+                //     executed). A rescue is the last widening rung: when Jev is still
+                //     stuck after context and the survey — or needs text nobody
+                //     dictated — ask and wait, since the step would otherwise end empty.
+                if let Some(two) = self.two.as_mut() {
+                    while let Some(reply) = two.try_recv() {
+                        two_notes.push(apply_reply(
+                            &reply,
+                            goal,
+                            &mut plan,
+                            &mut plan_i,
+                            &mut dictated,
+                            false,
+                        ));
+                    }
+                    let needs_text = matches!(verdict, policy::Verdict::NeedsText);
+                    let stuck = (matches!(verdict, policy::Verdict::Uncertain { .. })
+                        && widen >= consts::WIDEN_TWO)
+                        || (needs_text && dictated.is_none());
+                    if stuck && two.remaining() > 0 {
+                        let why = match &verdict {
+                            policy::Verdict::Uncertain { reason, .. } => reason.clone(),
+                            _ => "the goal needs text and none was dictated".to_string(),
+                        };
+                        let tag = steps as u64;
+                        let asked = two.ask(uc_two::Request {
+                            kind: uc_two::Kind::Rescue,
+                            tag,
+                            goal: goal.to_string(),
+                            subgoal: plan.as_ref().map(|p| p[plan_i].clone()),
+                            state: serde_json::from_slice(&state_bytes)?,
+                            jev: Some(json!({
+                                "target_top": signals.target_top,
+                                "op": signals.op,
+                                "op_conf": signals.op_conf,
+                                "goal_reached": signals.goal_reached,
+                                "needs_text": signals.needs_text,
+                            })),
+                            why: Some(why),
+                            need_text: needs_text || signals.needs_text >= 0.5,
+                        });
+                        if asked {
+                            let t_wait = Instant::now();
+                            let deadline = t_wait + Duration::from_millis(consts::TWO_WAIT_MS);
+                            let mut reply = None;
+                            while Instant::now() < deadline {
+                                if uc_win32::kill_switch_pressed() {
+                                    two_outcome = Some(Outcome::Killed);
                                     break;
                                 }
-                                // The worker is FIFO: a plan still in flight answers
-                                // first. Take it and keep waiting for ours.
-                                uc_two::Wait::Reply(r) => two_notes.push(apply_reply(
-                                    &r,
-                                    goal,
-                                    &mut plan,
-                                    &mut plan_i,
-                                    &mut dictated,
-                                    false,
-                                )),
-                                uc_two::Wait::Timeout => {}
-                                uc_two::Wait::Gone => break,
-                            }
-                        }
-                        match reply {
-                            Some(r) => {
-                                let mut note = apply_reply(
-                                    &r,
-                                    goal,
-                                    &mut plan,
-                                    &mut plan_i,
-                                    &mut dictated,
-                                    true,
-                                );
-                                let next_step = r.advice.as_ref().ok().and_then(|a| a.next.clone());
-                                if let Some(n) = next_step {
-                                    let v = policy::from_advice(
-                                        &n,
-                                        &reduced,
-                                        dictated.as_deref(),
-                                        allow_irreversible,
-                                        signals.is_destructive,
-                                    );
-                                    match &v {
-                                        policy::Verdict::Act { .. } | policy::Verdict::Done => {
-                                            note.applied = true;
-                                            two_decided = true;
-                                            verdict = v;
-                                        }
-                                        policy::Verdict::Blocked { reason }
-                                        | policy::Verdict::Uncertain { reason, .. } => {
-                                            note.note = format!("{} — {reason}", note.note);
-                                        }
-                                        policy::Verdict::NeedsText => {}
-                                    }
-                                } else if needs_text && dictated.is_some() {
-                                    // Text arrived: the original decision can now go ahead.
-                                    verdict = policy::judge(
-                                        &signals,
-                                        &reduced,
-                                        dictated.as_deref(),
-                                        allow_irreversible,
-                                    );
-                                    note.applied = matches!(verdict, policy::Verdict::Act { .. });
-                                    two_decided = note.applied;
+                                if stop_set(&stop_flag) {
+                                    two_outcome = Some(Outcome::Stopped);
+                                    break;
                                 }
-                                two_notes.push(note);
+                                match two.wait(Duration::from_millis(100)) {
+                                    uc_two::Wait::Reply(r)
+                                        if r.kind == uc_two::Kind::Rescue && r.tag == tag =>
+                                    {
+                                        reply = Some(r);
+                                        break;
+                                    }
+                                    // The worker is FIFO: a plan still in flight answers
+                                    // first. Take it and keep waiting for ours.
+                                    uc_two::Wait::Reply(r) => two_notes.push(apply_reply(
+                                        &r,
+                                        goal,
+                                        &mut plan,
+                                        &mut plan_i,
+                                        &mut dictated,
+                                        false,
+                                    )),
+                                    uc_two::Wait::Timeout => {}
+                                    uc_two::Wait::Gone => break,
+                                }
                             }
-                            None if two_outcome.is_none() => two_notes.push(uc_two::Note {
-                                kind: uc_two::Kind::Rescue,
-                                model: two.model().to_string(),
-                                ms: ms(t_wait),
-                                cost_usd: 0.0,
-                                note: "no reply within the wait budget".into(),
-                                applied: false,
-                            }),
-                            None => {}
+                            match reply {
+                                Some(r) => {
+                                    let mut note = apply_reply(
+                                        &r,
+                                        goal,
+                                        &mut plan,
+                                        &mut plan_i,
+                                        &mut dictated,
+                                        true,
+                                    );
+                                    let next_step =
+                                        r.advice.as_ref().ok().and_then(|a| a.next.clone());
+                                    if let Some(n) = next_step {
+                                        let v = policy::from_advice(
+                                            &n,
+                                            &reduced,
+                                            dictated.as_deref(),
+                                            allow_irreversible,
+                                            signals.is_destructive,
+                                        );
+                                        match &v {
+                                            policy::Verdict::Act { .. } | policy::Verdict::Done => {
+                                                note.applied = true;
+                                                two_decided = true;
+                                                verdict = v;
+                                            }
+                                            policy::Verdict::Blocked { reason }
+                                            | policy::Verdict::Uncertain { reason, .. } => {
+                                                note.note = format!("{} — {reason}", note.note);
+                                            }
+                                            policy::Verdict::NeedsText => {}
+                                        }
+                                    } else if needs_text && dictated.is_some() {
+                                        // Text arrived: the original decision can go ahead.
+                                        verdict = policy::judge(
+                                            &signals,
+                                            &reduced,
+                                            dictated.as_deref(),
+                                            allow_irreversible,
+                                        );
+                                        note.applied =
+                                            matches!(verdict, policy::Verdict::Act { .. });
+                                        two_decided = note.applied;
+                                    }
+                                    two_notes.push(note);
+                                }
+                                None if two_outcome.is_none() => two_notes.push(uc_two::Note {
+                                    kind: uc_two::Kind::Rescue,
+                                    model: two.model().to_string(),
+                                    ms: ms(t_wait),
+                                    cost_usd: 0.0,
+                                    note: "no reply within the wait budget".into(),
+                                    applied: false,
+                                }),
+                                None => {}
+                            }
                         }
                     }
                 }
-            }
+                (
+                    signals,
+                    verdict,
+                    step_tokens,
+                    step_cost,
+                    jev_ms,
+                    narrowed,
+                    signals_first,
+                    decision.timing.winner,
+                    est_tokens,
+                )
+            };
 
             let mut rec = StepRecord {
                 step: steps,
@@ -1397,7 +1846,11 @@ impl Runner {
                 title: scene.title.clone(),
                 raw_elements: scan.raw_count,
                 popups,
+                widen: step_widen,
+                survey: survey_note,
                 subgoal: subgoal_label.clone(),
+                minimized: Vec::new(),
+                refused: None,
                 two: two_notes,
                 sent_elements: reduced.len(),
                 est_tokens,
@@ -1409,7 +1862,7 @@ impl Runner {
                 total_ms: 0.0,
                 input_tokens: step_tokens,
                 cost_usd: step_cost,
-                hedged_winner: decision.timing.winner,
+                hedged_winner,
                 narrowed,
                 signals_first,
                 signals,
@@ -1432,10 +1885,10 @@ impl Runner {
                         plan_i += 1;
                         last_hash = None;
                         last_was_wait = false;
-                        uncertain = 0;
                         entropy_strikes = 0;
                         stall = 0;
                         waits = 0;
+                        widen = 0;
                     }
                     _ => next = Some(Outcome::Done),
                 },
@@ -1444,17 +1897,48 @@ impl Runner {
                     next = Some(Outcome::Blocked(reason.clone()))
                 }
                 policy::Verdict::Uncertain { reason, .. } => {
-                    uncertain += 1;
-                    if uncertain >= consts::UNCERTAIN_STRIKES {
-                        next = Some(Outcome::Uncertain(reason.clone()));
-                    } else {
-                        last =
-                            Some(json!({"op": "look", "effect": format!("uncertain: {reason}")}));
+                    if adopt_here {
+                        // The displacement survey says the window in front is the right
+                        // place after all: continue there.
+                        place_hwnd = Some(scene.hwnd);
+                        place_pid = Some(scene.pid);
+                        displaced = 0;
+                        last = Some(json!({
+                            "op": "look",
+                            "effect": format!("continuing in {} „{}”", scene.app, scene.title),
+                        }));
                         last_hash = None;
+                    } else {
+                        // Widen, one rung per uncertain step: context → survey →
+                        // System Two → give up. "No listed element helps" skips to the
+                        // survey: the right place is probably another window.
+                        let two_left = self.two.as_ref().is_some_and(|t| t.remaining() > 0);
+                        let mut rung =
+                            if rec.signals.target == "none" && widen < consts::WIDEN_SURVEY {
+                                consts::WIDEN_SURVEY
+                            } else {
+                                widen + 1
+                            };
+                        if rung == consts::WIDEN_TWO && !two_left {
+                            rung += 1;
+                        }
+                        if rung > consts::WIDEN_TWO {
+                            next = Some(Outcome::Uncertain(reason.clone()));
+                        } else {
+                            widen = rung;
+                            survey_only = rung == consts::WIDEN_SURVEY;
+                            last = Some(json!({
+                                "op": "look",
+                                "effect": format!(
+                                    "uncertain: {reason}; widening to {}",
+                                    widen_name(rung)
+                                ),
+                            }));
+                            last_hash = None;
+                        }
                     }
                 }
                 policy::Verdict::Act { action } => {
-                    uncertain = 0;
                     // The narrowed round reports the gates' entropy (0); the guard must
                     // look at the first, full distribution.
                     let entropy = rec
@@ -1478,31 +1962,79 @@ impl Runner {
                         next = Some(Outcome::Preview);
                     } else if uc_win32::kill_switch_pressed() {
                         next = Some(Outcome::Killed);
-                    } else if self.stop_requested() {
+                    } else if stop_set(&stop_flag) {
                         next = Some(Outcome::Stopped);
-                    } else if !focus_still_ours(locked_pid, target_hwnd) {
+                    } else if !focus_still_ours(scene.hwnd) {
                         // Deciding took 0.3–2 s; a toast, a UAC prompt or an Alt-Tab may
-                        // have moved the foreground meanwhile. Never inject blind.
-                        next = Some(Outcome::FocusLost(
-                            "foreground changed while deciding".into(),
-                        ));
+                        // have moved the foreground meanwhile. Never inject blind: skip
+                        // this step, the next one sees where the focus went.
+                        last = Some(json!({
+                            "op": "look",
+                            "effect": "foreground changed while deciding; nothing injected",
+                        }));
+                        last_hash = None;
                     } else {
                         let t_act = Instant::now();
-                        exec::perform(action)?;
-                        rec.act_ms = ms(t_act);
-                        rec.executed = true;
-                        last = Some(action_summary(action));
-                        last_hash = Some(hash);
-                        last_was_wait = matches!(action, policy::Action::Wait);
-                        if last_was_wait {
-                            waits += 1;
-                            if waits >= consts::WAIT_STRIKES {
-                                next = Some(Outcome::Stalled);
+                        match exec::perform(action) {
+                            Ok(minimized) => {
+                                rec.act_ms = ms(t_act);
+                                rec.executed = true;
+                                let mut summary = action_summary(action);
+                                if !minimized.is_empty() {
+                                    rec.minimized = minimized.clone();
+                                    summary["minimized"] = json!(minimized);
+                                }
+                                last = Some(summary);
+                                let window_op = matches!(
+                                    action,
+                                    policy::Action::Switch { .. } | policy::Action::ShowDesktop
+                                );
+                                // Visit counts; the desktop is key 0 (never a window handle).
+                                match action {
+                                    policy::Action::Switch { hwnd, .. } => {
+                                        *visits.entry(*hwnd).or_default() += 1;
+                                    }
+                                    policy::Action::ShowDesktop => {
+                                        *visits.entry(0).or_default() += 1;
+                                    }
+                                    _ => {}
+                                }
+                                // A new window is a new tree: no stall comparison across it.
+                                last_hash = if window_op { None } else { Some(hash) };
+                                // Only input and window ops can move the foreground; a
+                                // wait or a scroll followed by a new window in front is
+                                // the user's doing, and must read as a displacement.
+                                expect_change = !matches!(
+                                    action,
+                                    policy::Action::Wait | policy::Action::Scroll { .. }
+                                );
+                                widen = 0;
+                                displaced = 0;
+                                last_was_wait = matches!(action, policy::Action::Wait);
+                                if last_was_wait {
+                                    waits += 1;
+                                    if waits >= consts::WAIT_STRIKES {
+                                        next = Some(Outcome::Stalled);
+                                    }
+                                } else {
+                                    waits = 0;
+                                }
+                                std::thread::sleep(Duration::from_millis(consts::SETTLE_CAP_MS));
                             }
-                        } else {
-                            waits = 0;
+                            Err(LoopError::Window(msg)) => {
+                                // The window manager refused (foreground lock, an elevated
+                                // or a closed window): a step without effect, not the end
+                                // of the run. The rung stays, so the ladder moves on.
+                                rec.act_ms = ms(t_act);
+                                rec.refused = Some(msg.clone());
+                                last = Some(json!({
+                                    "op": "look",
+                                    "effect": format!("{msg}; nothing changed"),
+                                }));
+                                last_hash = None;
+                            }
+                            Err(e) => return Err(e),
                         }
-                        std::thread::sleep(Duration::from_millis(consts::SETTLE_CAP_MS));
                     }
                 }
             }
@@ -1538,13 +2070,11 @@ impl Runner {
     }
 }
 
-/// Is the locked process still in front and the target window still alive? Checked
-/// at the scan and again right before injecting.
-fn focus_still_ours(locked_pid: Option<u32>, target_hwnd: Option<isize>) -> bool {
-    let alive = target_hwnd
-        .is_none_or(|h| uc_win32::is_window(uc_win32::HWND(h as *mut core::ffi::c_void)));
-    let fg_pid = uc_win32::foreground_hwnd().map(uc_win32::window_pid);
-    alive && fg_pid.is_some() && fg_pid == locked_pid
+/// Is the window the step scanned still the one in front (and alive)? Checked right
+/// before injecting: the decision took 0.3–2 s and the coordinates belong to that tree.
+fn focus_still_ours(scanned_hwnd: isize) -> bool {
+    let h = hwnd_of(scanned_hwnd);
+    uc_win32::is_window(h) && uc_win32::foreground_hwnd().is_some_and(|fg| fg == h)
 }
 
 fn stop_set(flag: &Option<Arc<AtomicBool>>) -> bool {
@@ -1624,6 +2154,24 @@ fn action_summary(a: &policy::Action) -> Value {
             json!({"op": if *notches > 0 { "scroll_down" } else { "scroll_up" }})
         }
         policy::Action::Wait => json!({"op": "wait"}),
+        policy::Action::Switch { title, exe, .. } => {
+            json!({"op": "switch", "window": title, "exe": exe})
+        }
+        policy::Action::ShowDesktop => json!({"op": "show_desktop"}),
+    }
+}
+
+fn hwnd_of(h: isize) -> uc_win32::HWND {
+    uc_win32::HWND(h as *mut core::ffi::c_void)
+}
+
+/// Human name of a widening rung, for `last` and the log.
+fn widen_name(rung: u8) -> &'static str {
+    match rung {
+        r if r == consts::WIDEN_CONTEXT => "context (labels, more candidates)",
+        r if r == consts::WIDEN_SURVEY => "window survey",
+        r if r == consts::WIDEN_TWO => "System Two",
+        _ => "none",
     }
 }
 
@@ -2004,16 +2552,95 @@ mod tests {
     #[test]
     fn empty_spot_prefers_centre_then_grid_then_gives_up() {
         let rect = [0, 0, 1000, 800];
-        assert_eq!(empty_spot(rect, &[]), Some((500, 416)));
+        // Margin 16 / caption 48 at 96 DPI: the free area is 16..984 × 48..784.
+        assert_eq!(empty_spot(rect, &[], 96), Some((500, 416)));
+        // Doubled at 192 DPI: 32..968 × 96..768.
+        assert_eq!(empty_spot(rect, &[], 192), Some((500, 432)));
         let mut mid = el(0, "button", "Mid");
         mid.bbox = [400, 350, 200, 150];
+        let (x, y) = empty_spot(rect, &[mid], 96).expect("a free grid point");
         assert!(
-            matches!(empty_spot(rect, &[mid.clone()]), Some((x, y)) if !(388..612).contains(&x) || !(338..512).contains(&y))
+            (16..984).contains(&x) && (48..784).contains(&y),
+            "inside the area"
+        );
+        assert!(
+            !(388..612).contains(&x) || !(338..512).contains(&y),
+            "outside Mid and its halo: ({x}, {y})"
         );
         let mut all = el(1, "document", "Doc");
         all.bbox = [-20, -20, 1040, 840];
-        assert_eq!(empty_spot(rect, &[all]), None);
-        assert_eq!(empty_spot([0, 0, 20, 20], &[]), None);
+        assert_eq!(empty_spot(rect, &[all], 96), None);
+        assert_eq!(empty_spot([0, 0, 20, 20], &[], 96), None);
+    }
+
+    #[test]
+    fn survey_builds_ids_and_judges_thresholds() {
+        use uc_win32::WindowInfo;
+        let win = |hwnd: isize, title: &str, exe: &str| WindowInfo {
+            hwnd,
+            title: title.into(),
+            exe: exe.into(),
+            pid: 1,
+            minimized: false,
+        };
+        let windows = vec![
+            win(10, "Program Manager", "explorer.exe"),
+            win(11, "Notatnik", "notepad.exe"),
+            win(12, "Poczta", "olk.exe"),
+        ];
+        let (state, _compiled, cands) = survey::build(
+            "x",
+            &windows,
+            &survey::Current {
+                hwnd: 12,
+                app: "olk",
+                title: "Poczta",
+                displaced: true,
+                on_desktop: false,
+            },
+            None,
+        );
+        assert_eq!(cands.len(), 2, "the desktop is an option, not a window");
+        assert_eq!(state["windows"][1]["in_front"], true);
+        assert_eq!(state["current"]["displaced_by_user"], true);
+        let dec = |probs: &[(&str, f64)]| {
+            let mut m = std::collections::HashMap::new();
+            for (k, v) in probs {
+                m.insert(k.to_string(), *v);
+            }
+            uc_jev::Decision::from_probs("place", m)
+        };
+        let judge = |probs: &[(&str, f64)], on_desktop: bool, visited: &[isize]| {
+            survey::judge(&dec(probs), &cands, 12, on_desktop, visited)
+        };
+        let (choice, note) = judge(&[("w0", 0.9), ("desktop", 0.1)], false, &[]);
+        assert!(matches!(choice, survey::Choice::Switch(w) if w.hwnd == 11));
+        assert_eq!(note["top"][0][2], "Notatnik (notepad.exe)", "titles kept");
+        assert_eq!(
+            judge(&[("w1", 0.8), ("w0", 0.2)], false, &[]).0,
+            survey::Choice::Stay
+        );
+        assert_eq!(
+            judge(&[("desktop", 0.7), ("w0", 0.3)], false, &[]).0,
+            survey::Choice::Desktop
+        );
+        assert_eq!(
+            judge(&[("desktop", 0.7), ("w0", 0.3)], true, &[]).0,
+            survey::Choice::Stay,
+            "already on the desktop: no ShowDesktop no-op"
+        );
+        assert!(matches!(
+            judge(&[("w0", 0.9), ("desktop", 0.1)], false, &[11]).0,
+            survey::Choice::Unsure(_)
+        ));
+        assert!(matches!(
+            judge(&[("w0", 0.5), ("w1", 0.5)], false, &[]).0,
+            survey::Choice::Unsure(_)
+        ));
+        assert!(matches!(
+            judge(&[("none", 0.9), ("w0", 0.1)], false, &[]).0,
+            survey::Choice::Nothing(_)
+        ));
     }
 
     #[test]

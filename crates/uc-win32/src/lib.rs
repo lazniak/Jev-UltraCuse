@@ -5,16 +5,20 @@
 //! call [`ensure_dpi_aware`] once at process start, before any window is created.
 
 use serde::Serialize;
-use windows::core::{BOOL, PWSTR};
+use std::time::Duration;
+use windows::core::{w, BOOL, PCWSTR, PWSTR};
 pub use windows::Win32::Foundation::HWND;
 use windows::Win32::Foundation::{CloseHandle, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+};
 use windows::Win32::System::Console::{GetConsoleProcessList, GetConsoleWindow};
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::HiDpi::{
-    SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -22,8 +26,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
     GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, SetForegroundWindow, ShowWindow,
     SwitchToThisWindow, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
-    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE, SW_RESTORE, WS_EX_TOOLWINDOW, WS_POPUP,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE, SW_MINIMIZE, SW_RESTORE, WS_EX_TOOLWINDOW,
+    WS_POPUP,
 };
+use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, FindWindowW};
 
 /// Rectangle as `[x, y, w, h]` in physical screen pixels.
 pub type Rect = [i32; 4];
@@ -221,6 +227,17 @@ pub struct WindowInfo {
     pub title: String,
     pub exe: String,
     pub pid: u32,
+    #[serde(default)]
+    pub minimized: bool,
+}
+
+impl WindowInfo {
+    /// Explorer's desktop window ("Program Manager"): never a switch target — other
+    /// windows cover it, so a click at an icon's coordinates would land elsewhere.
+    /// [`show_desktop`] is the way there.
+    pub fn is_desktop(&self) -> bool {
+        self.title == "Program Manager" && self.exe.eq_ignore_ascii_case("explorer.exe")
+    }
 }
 
 /// Visible, titled, non-tool, non-cloaked top-level windows of other processes, in
@@ -260,6 +277,7 @@ pub fn list_windows() -> Vec<WindowInfo> {
             title,
             exe: process_exe(pid).unwrap_or_default(),
             pid,
+            minimized: IsIconic(hwnd).as_bool(),
         });
         true.into()
     }
@@ -267,6 +285,112 @@ pub fn list_windows() -> Vec<WindowInfo> {
     // SAFETY: the callback only touches `out` through the pointer we pass here.
     let _ = unsafe { EnumWindows(Some(cb), LPARAM(&mut out as *mut Vec<WindowInfo> as isize)) };
     out
+}
+
+/// Minimize a window: a plain `ShowWindow`, no input injection.
+pub fn minimize(hwnd: HWND) {
+    // SAFETY: plain user32 call on a handle we do not own.
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_MINIMIZE);
+    }
+}
+
+/// Window classes that *are* the desktop: the icon host and its wallpaper worker.
+pub fn is_desktop_class(class: &str) -> bool {
+    matches!(class, "Progman" | "WorkerW")
+}
+
+/// Shell surfaces that are never minimized: the desktop and the taskbars. The taskbar
+/// in front is *not* the desktop (its buttons would be scanned and clicked).
+pub fn is_shell_class(class: &str) -> bool {
+    is_desktop_class(class) || matches!(class, "Shell_TrayWnd" | "Shell_SecondaryTrayWnd")
+}
+
+/// The window's DPI (96 = 100 %); 96 when the handle is gone.
+pub fn dpi_of(hwnd: HWND) -> u32 {
+    // SAFETY: pure query; returns 0 for an invalid handle.
+    match unsafe { GetDpiForWindow(hwnd) } {
+        0 => 96,
+        d => d,
+    }
+}
+
+/// Work area `[x, y, w, h]` of the monitor the window is on (the taskbar excluded).
+pub fn work_area_of(hwnd: HWND) -> Option<Rect> {
+    // SAFETY: `MonitorFromWindow` with DEFAULTTONEAREST always yields a monitor;
+    // `GetMonitorInfoW` writes into a struct whose `cbSize` is set.
+    unsafe {
+        let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(mon, &mut info).as_bool() {
+            return None;
+        }
+        let r = info.rcWork;
+        Some([r.left, r.top, r.right - r.left, r.bottom - r.top])
+    }
+}
+
+/// Intersection of two `[x, y, w, h]` rectangles; `None` when they do not overlap.
+pub fn rect_intersect(a: Rect, b: Rect) -> Option<Rect> {
+    let x0 = a[0].max(b[0]);
+    let y0 = a[1].max(b[1]);
+    let x1 = (a[0] + a[2]).min(b[0] + b[2]);
+    let y1 = (a[1] + a[3]).min(b[1] + b[3]);
+    (x1 > x0 && y1 > y0).then_some([x0, y0, x1 - x0, y1 - y0])
+}
+
+/// The window that hosts the desktop icons (`SHELLDLL_DefView`): `Progman`, or the
+/// `WorkerW` Explorer re-parents it under when a wallpaper engine is active.
+pub fn desktop_hwnd() -> Option<HWND> {
+    // SAFETY: user32 lookups by class name; handles are not owned.
+    unsafe {
+        let progman = FindWindowW(w!("Progman"), PCWSTR::null()).ok()?;
+        let has_view =
+            |h: HWND| FindWindowExW(Some(h), None, w!("SHELLDLL_DefView"), PCWSTR::null()).is_ok();
+        if has_view(progman) {
+            return Some(progman);
+        }
+        let mut after: Option<HWND> = None;
+        while let Ok(w) = FindWindowExW(None, after, w!("WorkerW"), PCWSTR::null()) {
+            if has_view(w) {
+                return Some(w);
+            }
+            after = Some(w);
+        }
+        Some(progman)
+    }
+}
+
+/// Minimize whatever is in front until the desktop is (at most `max_n` windows), then
+/// activate the desktop. Returns the titles minimized, front first. Nothing is
+/// injected; every step is a `ShowWindow`, reversible from the taskbar.
+pub fn show_desktop(max_n: usize) -> Vec<String> {
+    let mut minimized = Vec::new();
+    for _ in 0..max_n {
+        let Some(fg) = foreground_hwnd() else {
+            break;
+        };
+        if is_shell_class(&window_class(fg)) {
+            break;
+        }
+        let title = window_title(fg);
+        minimize(fg);
+        std::thread::sleep(Duration::from_millis(80));
+        if foreground_hwnd() == Some(fg) {
+            // `ShowWindow` was refused (an elevated or topmost window): no progress,
+            // so stop instead of spending the budget on the same handle.
+            break;
+        }
+        minimized.push(title);
+    }
+    if let Some(d) = desktop_hwnd() {
+        // SAFETY: plain user32 call.
+        let _ = unsafe { SetForegroundWindow(d) };
+    }
+    minimized
 }
 
 /// Union of two `[x, y, w, h]` rectangles.

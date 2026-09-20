@@ -557,10 +557,7 @@ fn run(a: RunArgs) -> Result<()> {
         dictated: dictated.clone(),
         ledger_dir: Some(a.ledger_dir.clone().into()),
         provider,
-        target_pid: a
-            .hwnd
-            .map(|h| uc_win32::window_pid(uc_win32::HWND(h as *mut core::ffi::c_void))),
-        target_hwnd: a.hwnd,
+        start_hwnd: a.hwnd,
         stop: None,
         two,
     };
@@ -657,6 +654,8 @@ fn describe_action(a: &uc_loop::policy::Action) -> String {
         Action::Key { key } => format!("key {key}"),
         Action::Scroll { notches, .. } => format!("scroll {notches}"),
         Action::Wait => "wait".into(),
+        Action::Switch { title, exe, .. } => format!("switch to „{title}” ({exe})"),
+        Action::ShowDesktop => "show the desktop (minimize what covers it)".into(),
     }
 }
 
@@ -668,7 +667,13 @@ fn format_step(r: &uc_loop::StepRecord) -> String {
         Verdict::Act { action } => format!(
             "{}{}",
             describe_action(action),
-            if r.executed { " ✓" } else { " [preview]" }
+            if r.executed {
+                " ✓"
+            } else if r.refused.is_some() {
+                " [refused]"
+            } else {
+                " [preview]"
+            }
         ),
         Verdict::Uncertain { reason, .. } => format!("UNCERTAIN: {reason}"),
         Verdict::NeedsText => "NEEDS TEXT (quote it in the goal or pass --text)".to_string(),
@@ -713,6 +718,30 @@ fn format_step(r: &uc_loop::StepRecord) -> String {
 /// System Two's trace for a step: the sub-goal Jev was asked about and any consultation.
 fn two_lines(r: &uc_loop::StepRecord) -> String {
     let mut out = String::new();
+    if r.widen > 0 {
+        out.push_str(&format!("\n    widened: rung {}", r.widen));
+    }
+    if let Some(sv) = &r.survey {
+        let top: Vec<String> = sv["top"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|e| {
+                        let p = e.get(1)?.as_f64()?;
+                        let label = e.get(2).or_else(|| e.get(0))?.as_str()?;
+                        Some(format!("{label} {p:.2}"))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.push_str(&format!("\n    survey: {}", top.join(" | ")));
+    }
+    if let Some(m) = &r.refused {
+        out.push_str(&format!("\n    refused: {m}"));
+    }
+    if !r.minimized.is_empty() {
+        out.push_str(&format!("\n    minimized: {}", r.minimized.join(" | ")));
+    }
     if let Some(sg) = &r.subgoal {
         out.push_str(&format!("\n    subgoal {sg}"));
     }

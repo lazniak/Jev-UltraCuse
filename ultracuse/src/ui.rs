@@ -25,6 +25,7 @@ const POLL_MS: u64 = 250;
 const SETTINGS_FILE: &str = "ultracuse.settings.json";
 const MODEL_LIST_MAX: usize = 60;
 const TWO_COLOR: egui::Color32 = egui::Color32::from_rgb(200, 160, 255);
+const WIDEN_COLOR: egui::Color32 = egui::Color32::from_rgb(120, 200, 200);
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -122,15 +123,9 @@ struct App {
     allow_irreversible: bool,
     max_steps: usize,
     provider: ProviderChoice,
-    windows: Vec<WindowInfo>,
-    target: Option<isize>,
+    /// The last foreground window that is not ours: where the run starts (ADR-004 —
+    /// nothing to pick; from there the loop finds its way, or the desktop).
     last_active: Option<WindowInfo>,
-    /// "Point at the window": the next foreground window that is not ours becomes
-    /// the target, then capture disarms — so a detour through another app (the chat
-    /// you read instructions in) does not silently retarget the run.
-    capture_armed: bool,
-    /// The foreground at launch (the app we were started from) is not a capture.
-    initial_fg: Option<isize>,
     state: State,
     status: String,
     steps: Vec<StepRecord>,
@@ -173,11 +168,7 @@ impl App {
             allow_irreversible: false,
             max_steps: settings.max_steps.clamp(1, 40),
             provider,
-            windows: uc_win32::list_windows(),
-            target: None,
             last_active: None,
-            capture_armed: true,
-            initial_fg: uc_win32::foreground_hwnd().map(|h| h.0 as isize),
             state: State::Idle,
             status: "gotowe".into(),
             steps: Vec::new(),
@@ -265,21 +256,16 @@ impl App {
         !self.running() && !self.goal.trim().is_empty()
     }
 
-    fn chosen_target(&self) -> Option<WindowInfo> {
-        self.windows
-            .iter()
-            .find(|w| Some(w.hwnd) == self.target)
-            .cloned()
+    /// Where the run starts: the window the user was in before coming here, if it
+    /// still exists. `None` = whatever is in front once this window is minimized.
+    fn start_window(&self) -> Option<WindowInfo> {
+        self.last_active
+            .clone()
+            .filter(|w| uc_win32::is_window(uc_win32::HWND(w.hwnd as *mut core::ffi::c_void)))
     }
 
     fn start(&mut self, ctx: &egui::Context) {
-        let Some(win) = self.chosen_target() else {
-            self.error = Some(
-                "Wybierz okno docelowe (albo kliknij w nie, żeby stało się „ostatnio aktywne”)."
-                    .into(),
-            );
-            return;
-        };
+        let win = self.start_window();
         let goal = self.goal.trim().to_string();
         let dictated = if self.text.trim().is_empty() {
             uc_loop::extract_quoted(&goal)
@@ -313,8 +299,7 @@ impl App {
             dictated,
             ledger_dir: Some("runs".into()),
             provider,
-            target_pid: Some(win.pid),
-            target_hwnd: Some(win.hwnd),
+            start_hwnd: win.as_ref().map(|w| w.hwnd),
             stop: Some(self.stop.clone()),
             two,
         };
@@ -323,11 +308,17 @@ impl App {
         self.summary = None;
         self.error = None;
         self.state = State::Starting;
-        self.status = format!("start: {} ({})", win.title, win.exe);
+        self.status = match &win {
+            Some(w) => format!("start: {}", window_label(w, 40)),
+            None => "start: okno na wierzchu".into(),
+        };
+        // Out of the way: the run works where the user was, not here.
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         let (tx, rx) = mpsc::channel::<Msg>();
         self.rx = Some(rx);
         let ctx = ctx.clone();
-        let hwnd = win.hwnd;
+        let start = win.as_ref().map(|w| (w.hwnd, w.is_desktop()));
+        let armed = self.act;
         let spawned = std::thread::Builder::new()
             .name("uc-run".into())
             .spawn(move || {
@@ -354,10 +345,21 @@ impl App {
                     let _ = tx_step.send(Msg::Step(Box::new(r.clone())));
                     ctx_step.request_repaint();
                 }));
-                if !uc_win32::bring_to_front(uc_win32::HWND(hwnd as *mut core::ffi::c_void)) {
-                    return send(Msg::Error(
-                        "nie udało się wysunąć okna docelowego na wierzch".into(),
-                    ));
+                std::thread::sleep(Duration::from_millis(250));
+                if let Some((hwnd, to_desktop)) = start {
+                    if to_desktop {
+                        // Preview never touches the user's windows; armed, clear the
+                        // desktop the way the loop would.
+                        if armed {
+                            uc_win32::show_desktop(uc_loop::consts::SHOW_DESKTOP_MAX);
+                        }
+                    } else {
+                        // Refused (foreground lock) or gone: the run starts from whatever
+                        // is in front — the first step sees the difference and surveys.
+                        let _ = uc_win32::bring_to_front(uc_win32::HWND(
+                            hwnd as *mut core::ffi::c_void,
+                        ));
+                    }
                 }
                 match runner.run(&goal) {
                     Ok(s) => send(Msg::Done(Box::new(s))),
@@ -394,6 +396,7 @@ impl App {
                 self.state = State::Finished;
                 self.error
                     .get_or_insert_with(|| "wątek pętli zakończył się bez wyniku".into());
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             }
         }
         if self.last_poll.elapsed() >= Duration::from_millis(POLL_MS) {
@@ -404,8 +407,7 @@ impl App {
         }
     }
 
-    /// Remember the last foreground window that is not ours — the natural target
-    /// ("do it in the window I was just in").
+    /// Remember the last foreground window that is not ours — the run starts there.
     fn track_last_active(&mut self) {
         let Some(h) = uc_win32::foreground_hwnd() else {
             return;
@@ -418,24 +420,13 @@ impl App {
         if title.is_empty() {
             return;
         }
-        let info = WindowInfo {
+        self.last_active = Some(WindowInfo {
             hwnd: h.0 as isize,
             title,
             exe: uc_win32::process_exe(pid).unwrap_or_default(),
             pid,
-        };
-        if self.capture_armed
-            && self.target != Some(info.hwnd)
-            && self.initial_fg != Some(info.hwnd)
-        {
-            self.target = Some(info.hwnd);
-            self.capture_armed = false;
-            self.windows = uc_win32::list_windows();
-            if !self.windows.iter().any(|w| w.hwnd == info.hwnd) {
-                self.windows.insert(0, info.clone());
-            }
-        }
-        self.last_active = Some(info);
+            minimized: false,
+        });
     }
 
     fn handle(&mut self, m: Msg, ctx: &egui::Context) {
@@ -456,6 +447,7 @@ impl App {
                 self.status = outcome_text(&s.outcome);
                 self.summary = Some(*s);
                 self.state = State::Finished;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                 ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
                     egui::UserAttentionType::Informational,
                 ));
@@ -464,6 +456,7 @@ impl App {
                 self.error = Some(e);
                 self.state = State::Finished;
                 self.status = "błąd".into();
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             }
         }
     }
@@ -591,71 +584,28 @@ impl App {
     fn target_section(&mut self, ui: &mut egui::Ui) {
         ui.group(|ui| {
             ui.set_width(ui.available_width());
-            ui.label(egui::RichText::new("Okno docelowe").strong());
-            ui.horizontal(|ui| {
-                let selected = self
-                    .chosen_target()
-                    .map(|w| window_label(&w, 40))
-                    .unwrap_or_else(|| "— wybierz okno —".into());
-                let mut picked = false;
-                let combo = egui::ComboBox::from_id_salt("target-window")
-                    .width(400.0)
-                    .selected_text(selected)
-                    .show_ui(ui, |ui| {
-                        for w in &self.windows {
-                            if ui
-                                .selectable_value(
-                                    &mut self.target,
-                                    Some(w.hwnd),
-                                    window_label(w, 52),
-                                )
-                                .clicked()
-                            {
-                                picked = true;
-                            }
-                        }
-                    });
-                if picked {
-                    self.capture_armed = false;
-                }
-                if combo.response.clicked() {
-                    self.windows = uc_win32::list_windows();
-                }
-                if ui
-                    .button("↻")
-                    .on_hover_text("odśwież listę okien")
-                    .clicked()
-                {
-                    self.windows = uc_win32::list_windows();
-                }
-            });
-            ui.horizontal(|ui| {
-                if self.capture_armed {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(255, 200, 90),
-                        "🎯 kliknij teraz w docelowe okno (albo pulpit) — złapię je i wrócisz tutaj",
-                    );
-                } else {
-                    if ui
-                        .button("🎯 wskaż okno")
-                        .on_hover_text("Następne okno, w które klikniesz, stanie się celem.")
-                        .clicked()
-                    {
-                        self.capture_armed = true;
-                        self.initial_fg = None;
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("Start:").strong());
+                match self.start_window() {
+                    Some(w) => {
+                        ui.label(egui::RichText::new(window_label(&w, 48)).color(WIDEN_COLOR));
+                        ui.label(egui::RichText::new(format!("pid {}", w.pid)).weak().small());
                     }
-                    match self.chosen_target() {
-                        Some(w) => {
-                            ui.label(
-                                egui::RichText::new(format!("pid {} · {}", w.pid, w.exe)).weak(),
-                            );
-                        }
-                        None => {
-                            ui.label(egui::RichText::new("albo wybierz z listy").weak());
-                        }
+                    None => {
+                        ui.label(
+                            egui::RichText::new("to, co będzie na wierzchu po zminimalizowaniu tego okna")
+                                .weak(),
+                        );
                     }
                 }
             });
+            ui.label(
+                egui::RichText::new(
+                    "Nic nie wskazujesz: pętla rusza z okna, w którym byłeś przed chwilą, i sama                      szuka dalej — najpierw więcej elementów, potem przegląd otwartych okien                      (przełączy się albo zminimalizuje je do pulpitu), na końcu System Two.",
+                )
+                .weak()
+                .small(),
+            );
         });
     }
 
@@ -924,7 +874,7 @@ fn install_fonts(ctx: &egui::Context) {
 /// How a window is named in the picker: the desktop gets its own name instead of
 /// Explorer's internal "Program Manager".
 fn window_label(w: &WindowInfo, max: usize) -> String {
-    if w.exe.eq_ignore_ascii_case("explorer.exe") && w.title == "Program Manager" {
+    if w.is_desktop() {
         return "Pulpit (explorer.exe)".into();
     }
     format!("{} ({})", short(&w.title, max), w.exe)
@@ -953,8 +903,8 @@ fn outcome_text(o: &Outcome) -> String {
         Outcome::Stalled => "Brak zmian na ekranie po akcjach".into(),
         Outcome::Killed => "Kill-switch Ctrl+Alt+K".into(),
         Outcome::Stopped => "Zatrzymane".into(),
-        Outcome::FocusLost(r) => format!("Utrata fokusu — {r}"),
-        Outcome::TargetGone => "Okno docelowe zniknęło (przy „zamknij” to zwykle sukces)".into(),
+        Outcome::FocusLost(r) => format!("Fokus poza miejscem pracy — przerwane ({r})"),
+        Outcome::TargetGone => "Okno zniknęło bez udziału pętli".into(),
     }
 }
 
@@ -981,7 +931,35 @@ fn action_text(a: &Action) -> String {
             }
         }
         Action::Wait => "czekaj".into(),
+        Action::Switch { title, exe, .. } => format!("przełącz na „{}” ({exe})", short(title, 40)),
+        Action::ShowDesktop => "pokaż pulpit (minimalizuje okna z wierzchu)".into(),
     }
+}
+
+fn widen_text(rung: u8) -> &'static str {
+    match rung {
+        1 => "kontekst — etykiety i więcej kandydatów",
+        2 => "przegląd otwartych okien",
+        3 => "System Two",
+        _ => "—",
+    }
+}
+
+fn survey_text(v: &serde_json::Value) -> String {
+    v["top"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|e| {
+                    let id = e.get(0)?.as_str()?;
+                    let p = e.get(1)?.as_f64()?;
+                    let label = e.get(2).and_then(|l| l.as_str()).unwrap_or(id);
+                    Some(format!("{} {:.2}", short(label, 28), p))
+                })
+                .collect::<Vec<_>>()
+                .join(" · ")
+        })
+        .unwrap_or_default()
 }
 
 fn step_card(ui: &mut egui::Ui, r: &StepRecord) {
@@ -994,7 +972,13 @@ fn step_card(ui: &mut egui::Ui, r: &StepRecord) {
             format!(
                 "{} {}",
                 action_text(action),
-                if r.executed { "✓" } else { "[podgląd]" }
+                if r.executed {
+                    "✓"
+                } else if r.refused.is_some() {
+                    "[odmowa]"
+                } else {
+                    "[podgląd]"
+                }
             ),
             if r.executed {
                 egui::Color32::from_rgb(120, 180, 255)
@@ -1036,6 +1020,34 @@ fn step_card(ui: &mut egui::Ui, r: &StepRecord) {
                 .weak(),
             );
         });
+        if r.widen > 0 {
+            ui.label(
+                egui::RichText::new(format!("poszerzanie: {}", widen_text(r.widen)))
+                    .color(WIDEN_COLOR)
+                    .small(),
+            );
+        }
+        if let Some(sv) = &r.survey {
+            ui.label(
+                egui::RichText::new(format!("przegląd okien: {}", survey_text(sv)))
+                    .color(WIDEN_COLOR)
+                    .small(),
+            );
+        }
+        if let Some(m) = &r.refused {
+            ui.label(
+                egui::RichText::new(format!("odmowa: {m}"))
+                    .color(WIDEN_COLOR)
+                    .small(),
+            );
+        }
+        if !r.minimized.is_empty() {
+            ui.label(
+                egui::RichText::new(format!("zminimalizowane: {}", r.minimized.join(" · ")))
+                    .color(WIDEN_COLOR)
+                    .small(),
+            );
+        }
         if let Some(sg) = &r.subgoal {
             ui.label(
                 egui::RichText::new(format!("podcel {sg}"))
