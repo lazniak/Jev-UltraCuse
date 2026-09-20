@@ -31,6 +31,10 @@ target\release\ultracuse.exe ps "Get-ChildItem $env:USERPROFILE\Desktop | Select
 
 ## Szybki start (MVP-1)
 
+**Okno** — `ultracuse.exe` bez argumentów (dwuklik) otwiera okno: wybór okna docelowego (lista albo „śledź ostatnio aktywne”: klikasz w docelową aplikację, wracasz, jest wybrana), pole celu, opcjonalny tekst do wpisania, przełączniki *Uzbrojone* / *Zezwól na nieodwracalne*, limit kroków, Start (Ctrl+Enter) / Stop (Esc), log kroków na żywo (co pętla zobaczyła, co zdecydował Jev, co zrobiła) i podsumowanie z kosztem. Okno nigdy nie jest celem: pętla wysuwa wybrane okno na wierzch i blokuje się na jego procesie. Renderowanie: egui/wgpu (DX12), czytniki ekranu przez AccessKit.
+
+**CLI** — te same możliwości z terminala:
+
 ```powershell
 ultracuse doctor                                                      # DPI, UIA, pwsh, klucz Jev + jedna mini-decyzja
 ultracuse run "Wpisz „hello ultracuse” w edytorze tekstu"            # podgląd: 3 s na przełączenie okna, pokazuje pierwszą decyzję, nic nie wstrzykuje

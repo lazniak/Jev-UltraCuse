@@ -9,6 +9,8 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -80,6 +82,9 @@ pub mod consts {
         "truncate",
     ];
 
+    /// Keys that destroy or send regardless of the control under focus.
+    pub const DESTRUCTIVE_KEYS: [&str; 2] = ["delete", "shift+delete"];
+
     pub fn is_irreversible_name(name: &str) -> bool {
         let n = name.to_lowercase();
         IRREVERSIBLE_MARKERS.iter().any(|m| n.contains(m))
@@ -93,8 +98,12 @@ pub mod consts {
         pub const TARGET_NONE: &str =
             "No listed element advances `goal`; a key, scroll or wait is needed.";
         pub const OP: &str = "What kind of input advances `goal` from this screen?";
-        pub const OPS: [(&str, &str); 7] = [
+        pub const OPS: [(&str, &str); 8] = [
             ("click", "Activate a visible control."),
+            (
+                "right_click",
+                "Open the context menu of a control or of the background.",
+            ),
             ("type", "Enter `dictated` text into a text field."),
             ("key", "Press a keyboard shortcut (see `key`)."),
             ("scroll_down", "Content needed is below the visible area."),
@@ -103,8 +112,10 @@ pub mod consts {
             ("done", "`goal` is already satisfied by the visible state."),
         ];
         pub const KEY: &str = "If a key press is the next step, which one?";
-        pub const KEYS: [(&str, &str); 8] = [
+        pub const KEYS: [(&str, &str); 10] = [
             ("enter", "Confirm / activate the default button."),
+            ("f2", "Rename the selected item."),
+            ("delete", "Delete the selected item (hard to undo)."),
             ("esc", "Cancel / close the dialog or menu."),
             ("tab", "Move focus to the next control."),
             ("ctrl+s", "Save."),
@@ -217,6 +228,8 @@ pub mod policy {
             name: String,
             x: i32,
             y: i32,
+            /// Context menu instead of activation.
+            right: bool,
         },
         Type {
             text: String,
@@ -382,7 +395,8 @@ pub mod policy {
             narrow: shortlist(s),
         };
         let destructive = s.is_destructive >= DESTRUCTIVE_BLOCK
-            || target_el.is_some_and(|e| is_irreversible_name(&e.name));
+            || target_el.is_some_and(|e| is_irreversible_name(&e.name))
+            || (s.op == "key" && DESTRUCTIVE_KEYS.contains(&s.key.as_str()));
         let blocked = |what: &str| {
             Verdict::Blocked {
             reason: format!(
@@ -456,7 +470,7 @@ pub mod policy {
                     },
                 }
             }
-            "click" => {
+            "click" | "right_click" => {
                 let Some(el) = target_el else {
                     return unsure("click without a listed target".into());
                 };
@@ -487,6 +501,7 @@ pub mod policy {
                         name: describe(el),
                         x,
                         y,
+                        right: s.op == "right_click",
                     },
                 }
             }
@@ -510,8 +525,8 @@ pub mod exec {
     /// beyond what `uc-input` already does.
     pub fn perform(a: &Action) -> Result<(), uc_input::InputError> {
         match a {
-            Action::Click { x, y, .. } => {
-                uc_input::click(*x, *y, Button::Left, 1)?;
+            Action::Click { x, y, right, .. } => {
+                uc_input::click(*x, *y, if *right { Button::Right } else { Button::Left }, 1)?;
             }
             Action::Type { text, focus, .. } => {
                 if let Some((x, y)) = focus {
@@ -650,6 +665,9 @@ pub struct RunOpts {
     /// The window the run started on (`None` = the foreground window at step 1);
     /// when it stops existing the run ends with [`Outcome::TargetGone`].
     pub target_hwnd: Option<isize>,
+    /// Cooperative stop from another thread (a Stop button); checked wherever the
+    /// kill switch is.
+    pub stop: Option<Arc<AtomicBool>>,
 }
 
 impl Default for RunOpts {
@@ -663,6 +681,7 @@ impl Default for RunOpts {
             provider: None,
             target_pid: None,
             target_hwnd: None,
+            stop: None,
         }
     }
 }
@@ -708,7 +727,10 @@ pub enum Outcome {
     NeedsText,
     Blocked(String),
     Stalled,
+    /// Ctrl+Alt+K.
     Killed,
+    /// The caller asked to stop (`RunOpts::stop`).
+    Stopped,
     /// Another process took the foreground; nothing was injected into it.
     FocusLost(String),
     /// The window the run started on no longer exists (closed by the last action or
@@ -764,6 +786,13 @@ impl Runner {
         self.client.provider()
     }
 
+    fn stop_requested(&self) -> bool {
+        self.opts
+            .stop
+            .as_ref()
+            .is_some_and(|f| f.load(Ordering::Relaxed))
+    }
+
     /// Open the HTTP/2 connection with one tiny decision; returns its latency in ms.
     pub fn warm(&self) -> Result<f64, LoopError> {
         Ok(self.rt.block_on(self.client.warm())?)
@@ -795,6 +824,9 @@ impl Runner {
             }
             if uc_win32::kill_switch_pressed() {
                 break Outcome::Killed;
+            }
+            if self.stop_requested() {
+                break Outcome::Stopped;
             }
             steps += 1;
             let t0 = Instant::now();
@@ -1012,6 +1044,8 @@ impl Runner {
                         next = Some(Outcome::Preview);
                     } else if uc_win32::kill_switch_pressed() {
                         next = Some(Outcome::Killed);
+                    } else if self.stop_requested() {
+                        next = Some(Outcome::Stopped);
                     } else if !focus_still_ours(locked_pid, target_hwnd) {
                         // Deciding took 0.3–2 s; a toast, a UAC prompt or an Alt-Tab may
                         // have moved the foreground meanwhile. Never inject blind.
@@ -1084,7 +1118,9 @@ fn open_ledger(dir: &Path, goal: &str) -> Result<(std::fs::File, PathBuf), LoopE
 /// What the next state says about the previous action (`last` in the Jev state).
 fn action_summary(a: &policy::Action) -> Value {
     match a {
-        policy::Action::Click { name, .. } => json!({"op": "click", "target": name}),
+        policy::Action::Click { name, right, .. } => {
+            json!({"op": if *right { "right_click" } else { "click" }, "target": name})
+        }
         policy::Action::Type {
             text, target_name, ..
         } => json!({"op": "type", "text": text, "target": target_name}),
@@ -1291,6 +1327,25 @@ mod tests {
             } => assert_eq!(focus, None),
             other => panic!("expected type, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn right_click_and_destructive_keys() {
+        let els = [el(0, "listitem", "Pulpit")];
+        match judge(&sig("right_click", "e0", 0.9, 0.9), &els, None, false) {
+            Verdict::Act {
+                action: Action::Click { right, .. },
+            } => assert!(right),
+            other => panic!("expected right click, got {other:?}"),
+        }
+        let mut s = sig("key", "none", 0.9, 0.9);
+        s.key = "delete".into();
+        assert!(matches!(
+            judge(&s, &els, None, false),
+            Verdict::Blocked { .. }
+        ));
+        s.key_conf = 0.95;
+        assert!(matches!(judge(&s, &els, None, true), Verdict::Act { .. }));
     }
 
     #[test]

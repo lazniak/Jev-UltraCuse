@@ -8,6 +8,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use serde_json::json;
 
+mod ui;
+
 #[derive(Parser)]
 #[command(
     name = "ultracuse",
@@ -15,8 +17,9 @@ use serde_json::json;
     about = "Jev-UltraCuse — Computer Use decided by Jev, driven by voice"
 )]
 struct Cli {
+    /// No subcommand = open the window.
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
@@ -68,6 +71,8 @@ enum Cmd {
         #[arg(long)]
         allow_destructive: bool,
     },
+    /// Open the window (the default when no subcommand is given).
+    Ui,
     /// MVP loop: perceive the foreground window, ask Jev, act (with --act), repeat.
     Run(RunArgs),
     /// Inject a click at screen coordinates (requires --act).
@@ -83,6 +88,14 @@ fn main() -> Result<()> {
     uc_win32::ensure_dpi_aware();
     let cli = Cli::parse();
     match cli.cmd {
+        None | Some(Cmd::Ui) => ui::run_ui(),
+        Some(cmd) => cli_cmd(cmd),
+    }
+}
+
+fn cli_cmd(cmd: Cmd) -> Result<()> {
+    match cmd {
+        Cmd::Ui => unreachable!("handled in main"),
         Cmd::Doctor => doctor(),
         Cmd::Probe {
             delay,
@@ -524,6 +537,7 @@ fn run(a: RunArgs) -> Result<()> {
             .hwnd
             .map(|h| uc_win32::window_pid(uc_win32::HWND(h as *mut core::ffi::c_void))),
         target_hwnd: a.hwnd,
+        stop: None,
     };
     let mut runner = uc_loop::Runner::new(opts).context("runner init")?;
     let warm = runner.warm().context("jev warm-up")?;
@@ -589,8 +603,15 @@ fn describe_action(a: &uc_loop::policy::Action) -> String {
     use uc_loop::policy::Action;
     match a {
         Action::Click {
-            target, name, x, y, ..
-        } => format!("click e{target} {name} @({x},{y})"),
+            target,
+            name,
+            x,
+            y,
+            right,
+        } => format!(
+            "{} e{target} {name} @({x},{y})",
+            if *right { "right-click" } else { "click" }
+        ),
         Action::Type {
             text, target_name, ..
         } => format!(
