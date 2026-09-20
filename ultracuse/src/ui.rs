@@ -125,7 +125,12 @@ struct App {
     windows: Vec<WindowInfo>,
     target: Option<isize>,
     last_active: Option<WindowInfo>,
-    use_last_active: bool,
+    /// "Point at the window": the next foreground window that is not ours becomes
+    /// the target, then capture disarms — so a detour through another app (the chat
+    /// you read instructions in) does not silently retarget the run.
+    capture_armed: bool,
+    /// The foreground at launch (the app we were started from) is not a capture.
+    initial_fg: Option<isize>,
     state: State,
     status: String,
     steps: Vec<StepRecord>,
@@ -171,7 +176,8 @@ impl App {
             windows: uc_win32::list_windows(),
             target: None,
             last_active: None,
-            use_last_active: true,
+            capture_armed: true,
+            initial_fg: uc_win32::foreground_hwnd().map(|h| h.0 as isize),
             state: State::Idle,
             status: "gotowe".into(),
             steps: Vec::new(),
@@ -418,8 +424,12 @@ impl App {
             exe: uc_win32::process_exe(pid).unwrap_or_default(),
             pid,
         };
-        if self.use_last_active && self.target != Some(info.hwnd) {
+        if self.capture_armed
+            && self.target != Some(info.hwnd)
+            && self.initial_fg != Some(info.hwnd)
+        {
             self.target = Some(info.hwnd);
+            self.capture_armed = false;
             self.windows = uc_win32::list_windows();
             if !self.windows.iter().any(|w| w.hwnd == info.hwnd) {
                 self.windows.insert(0, info.clone());
@@ -585,20 +595,29 @@ impl App {
             ui.horizontal(|ui| {
                 let selected = self
                     .chosen_target()
-                    .map(|w| format!("{} ({})", short(&w.title, 40), w.exe))
+                    .map(|w| window_label(&w, 40))
                     .unwrap_or_else(|| "— wybierz okno —".into());
+                let mut picked = false;
                 let combo = egui::ComboBox::from_id_salt("target-window")
                     .width(400.0)
                     .selected_text(selected)
                     .show_ui(ui, |ui| {
                         for w in &self.windows {
-                            ui.selectable_value(
-                                &mut self.target,
-                                Some(w.hwnd),
-                                format!("{} ({})", short(&w.title, 52), w.exe),
-                            );
+                            if ui
+                                .selectable_value(
+                                    &mut self.target,
+                                    Some(w.hwnd),
+                                    window_label(w, 52),
+                                )
+                                .clicked()
+                            {
+                                picked = true;
+                            }
                         }
                     });
+                if picked {
+                    self.capture_armed = false;
+                }
                 if combo.response.clicked() {
                     self.windows = uc_win32::list_windows();
                 }
@@ -611,17 +630,29 @@ impl App {
                 }
             });
             ui.horizontal(|ui| {
-                ui.checkbox(&mut self.use_last_active, "śledź ostatnio aktywne okno")
-                    .on_hover_text("Kliknij w docelowe okno, wróć tutaj — będzie już wybrane.");
-                match self.chosen_target() {
-                    Some(w) => {
-                        ui.label(egui::RichText::new(format!("pid {} · {}", w.pid, w.exe)).weak());
+                if self.capture_armed {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 200, 90),
+                        "🎯 kliknij teraz w docelowe okno (albo pulpit) — złapię je i wrócisz tutaj",
+                    );
+                } else {
+                    if ui
+                        .button("🎯 wskaż okno")
+                        .on_hover_text("Następne okno, w które klikniesz, stanie się celem.")
+                        .clicked()
+                    {
+                        self.capture_armed = true;
+                        self.initial_fg = None;
                     }
-                    None => {
-                        ui.label(
-                            egui::RichText::new("kliknij w docelowe okno albo wybierz z listy")
-                                .weak(),
-                        );
+                    match self.chosen_target() {
+                        Some(w) => {
+                            ui.label(
+                                egui::RichText::new(format!("pid {} · {}", w.pid, w.exe)).weak(),
+                            );
+                        }
+                        None => {
+                            ui.label(egui::RichText::new("albo wybierz z listy").weak());
+                        }
                     }
                 }
             });
@@ -888,6 +919,15 @@ fn install_fonts(ctx: &egui::Context) {
         }
     }
     ctx.set_fonts(fonts);
+}
+
+/// How a window is named in the picker: the desktop gets its own name instead of
+/// Explorer's internal "Program Manager".
+fn window_label(w: &WindowInfo, max: usize) -> String {
+    if w.exe.eq_ignore_ascii_case("explorer.exe") && w.title == "Program Manager" {
+        return "Pulpit (explorer.exe)".into();
+    }
+    format!("{} ({})", short(&w.title, max), w.exe)
 }
 
 fn short(s: &str, max: usize) -> String {
