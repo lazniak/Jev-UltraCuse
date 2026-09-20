@@ -5,9 +5,11 @@
 //! call [`ensure_dpi_aware`] once at process start, before any window is created.
 
 use serde::Serialize;
-use windows::core::PWSTR;
+use windows::core::{BOOL, PWSTR};
 pub use windows::Win32::Foundation::HWND;
-use windows::Win32::Foundation::{CloseHandle, POINT, RECT};
+use windows::Win32::Foundation::{CloseHandle, LPARAM, POINT, RECT};
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+use windows::Win32::System::Console::{GetConsoleProcessList, GetConsoleWindow};
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
 };
@@ -16,10 +18,11 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClassNameW, GetCursorPos, GetForegroundWindow, GetSystemMetrics, GetWindowRect,
-    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
-    SetForegroundWindow, ShowWindow, SwitchToThisWindow, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
-    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_RESTORE,
+    EnumWindows, GetClassNameW, GetCursorPos, GetForegroundWindow, GetSystemMetrics,
+    GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, SetForegroundWindow, ShowWindow,
+    SwitchToThisWindow, GWL_EXSTYLE, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN, SW_HIDE, SW_RESTORE, WS_EX_TOOLWINDOW,
 };
 
 /// Rectangle as `[x, y, w, h]` in physical screen pixels.
@@ -209,4 +212,75 @@ pub fn scene() -> Option<Scene> {
         cursor: cursor_pos(),
         fg: true,
     })
+}
+
+/// A top-level window a user could name as the target of a task.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct WindowInfo {
+    pub hwnd: isize,
+    pub title: String,
+    pub exe: String,
+    pub pid: u32,
+}
+
+/// Visible, titled, non-tool, non-cloaked top-level windows of other processes, in
+/// Z-order (front first). ~1 ms.
+pub fn list_windows() -> Vec<WindowInfo> {
+    unsafe extern "system" fn cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        // SAFETY: `lparam` is the `Vec` passed by `list_windows`, alive for the whole
+        // enumeration; every other call is a plain user32/dwmapi query on the handle.
+        let out = &mut *(lparam.0 as *mut Vec<WindowInfo>);
+        if !IsWindowVisible(hwnd).as_bool() {
+            return true.into();
+        }
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        if ex & WS_EX_TOOLWINDOW.0 != 0 {
+            return true.into();
+        }
+        let mut cloaked: u32 = 0;
+        let _ = DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            &mut cloaked as *mut u32 as *mut core::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+        );
+        if cloaked != 0 {
+            return true.into();
+        }
+        let title = window_title(hwnd);
+        if title.is_empty() {
+            return true.into();
+        }
+        let pid = window_pid(hwnd);
+        if pid == std::process::id() {
+            return true.into();
+        }
+        out.push(WindowInfo {
+            hwnd: hwnd.0 as isize,
+            title,
+            exe: process_exe(pid).unwrap_or_default(),
+            pid,
+        });
+        true.into()
+    }
+    let mut out: Vec<WindowInfo> = Vec::with_capacity(32);
+    // SAFETY: the callback only touches `out` through the pointer we pass here.
+    let _ = unsafe { EnumWindows(Some(cb), LPARAM(&mut out as *mut Vec<WindowInfo> as isize)) };
+    out
+}
+
+/// Hide the console when this process is its only owner (the exe was double-clicked);
+/// leave it alone when launched from a terminal, so CLI output keeps working.
+pub fn hide_own_console() {
+    // SAFETY: console queries; a null handle simply means "no console".
+    unsafe {
+        let hwnd = GetConsoleWindow();
+        if hwnd.0.is_null() {
+            return;
+        }
+        let mut pids = [0u32; 4];
+        if GetConsoleProcessList(&mut pids) == 1 {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+    }
 }
