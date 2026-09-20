@@ -714,15 +714,11 @@ fn format_step(r: &uc_loop::StepRecord) -> String {
 fn two_lines(r: &uc_loop::StepRecord) -> String {
     let mut out = String::new();
     if let Some(sg) = &r.subgoal {
-        out.push_str(&format!(
-            "
-    subgoal {sg}"
-        ));
+        out.push_str(&format!("\n    subgoal {sg}"));
     }
-    if let Some(t) = &r.two {
+    for t in &r.two {
         out.push_str(&format!(
-            "
-    system two {:?} {} {:.0} ms ${:.4}{}: {}",
+            "\n    system two {:?} {} {:.0} ms ${:.4}{}: {}",
             t.kind,
             t.model,
             t.ms,
