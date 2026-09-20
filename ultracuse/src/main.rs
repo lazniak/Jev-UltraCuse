@@ -251,16 +251,11 @@ fn probe(delay: u64, as_json: bool, context: bool, max: usize, hwnd: Option<isiz
     }
     let scanner = uc_uia::UiaScanner::new().context("UIA init")?;
     let scene = target_scene(hwnd)?;
-    let scan = scanner.scan_hwnd(scene.hwnd(), context);
-    let reduced = uc_uia::reduce(
-        &scan.elements,
-        uc_uia::ReduceOpts {
-            max_n: max,
-            near: Some(scene.cursor),
-            viewport: Some(scene.rect),
-            ..Default::default()
-        },
-    );
+    let uc_loop::Perception {
+        scan,
+        reduced,
+        popups,
+    } = uc_loop::perceive(&scanner, &scene, context, max);
     let hash = uc_uia::tree_hash(&reduced);
     let state = uc_uia::GuiState {
         goal: "<goal>",
@@ -282,7 +277,7 @@ fn probe(delay: u64, as_json: bool, context: bool, max: usize, hwnd: Option<isiz
         "{} [{}] pid={} rect={:?} cursor={:?}",
         scene.title, scene.exe, scene.pid, scene.rect, scene.cursor
     );
-    println!("scan: {} raw → {} kept → {} reduced | find {:.1} ms + read {:.1} ms = {:.1} ms | hash {:016x} | ~{} tokens", scan.raw_count, scan.elements.len(), reduced.len(), scan.find_ms, scan.read_ms, scan.total_ms, hash, state.estimate_tokens());
+    println!("scan: {} raw → {} kept → {} reduced | {popups} pop-up(s) | find {:.1} ms + read {:.1} ms = {:.1} ms | hash {:016x} | ~{} tokens", scan.raw_count, scan.elements.len(), reduced.len(), scan.find_ms, scan.read_ms, scan.total_ms, hash, state.estimate_tokens());
     if let Some(e) = &scan.error {
         println!("ERROR: {e}");
     }

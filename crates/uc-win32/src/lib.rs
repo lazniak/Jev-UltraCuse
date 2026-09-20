@@ -18,11 +18,11 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClassNameW, GetCursorPos, GetForegroundWindow, GetSystemMetrics,
+    EnumWindows, GetClassNameW, GetCursorPos, GetForegroundWindow, GetSystemMetrics, GetWindow,
     GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
     GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, SetForegroundWindow, ShowWindow,
-    SwitchToThisWindow, GWL_EXSTYLE, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-    SM_YVIRTUALSCREEN, SW_HIDE, SW_RESTORE, WS_EX_TOOLWINDOW,
+    SwitchToThisWindow, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_HIDE, SW_RESTORE, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 /// Rectangle as `[x, y, w, h]` in physical screen pixels.
@@ -267,6 +267,69 @@ pub fn list_windows() -> Vec<WindowInfo> {
     // SAFETY: the callback only touches `out` through the pointer we pass here.
     let _ = unsafe { EnumWindows(Some(cb), LPARAM(&mut out as *mut Vec<WindowInfo> as isize)) };
     out
+}
+
+/// Union of two `[x, y, w, h]` rectangles.
+pub fn rect_union(a: Rect, b: Rect) -> Rect {
+    if a[2] <= 0 || a[3] <= 0 {
+        return b;
+    }
+    if b[2] <= 0 || b[3] <= 0 {
+        return a;
+    }
+    let x = a[0].min(b[0]);
+    let y = a[1].min(b[1]);
+    let r = (a[0] + a[2]).max(b[0] + b[2]);
+    let btm = (a[1] + a[3]).max(b[1] + b[3]);
+    [x, y, r - x, btm - y]
+}
+
+/// Visible pop-ups of process `pid` other than `main`: context menus (`#32768`),
+/// drop-down lists, XAML flyouts, owned dialogs — every `WS_POPUP` or owned top-level
+/// window with a non-empty rectangle, tooltips excluded. Front-most first, at most
+/// `max_n`. These never become the foreground window, so a scan of the foreground
+/// alone would miss them. ~1 ms.
+pub fn popups_of(pid: u32, main: HWND, max_n: usize) -> Vec<(HWND, Rect)> {
+    struct Ctx {
+        pid: u32,
+        main: HWND,
+        max_n: usize,
+        out: Vec<(HWND, Rect)>,
+    }
+    unsafe extern "system" fn cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        // SAFETY: `lparam` is the `Ctx` owned by `popups_of` for the whole enumeration;
+        // everything else is a plain user32 query on the handle.
+        let ctx = &mut *(lparam.0 as *mut Ctx);
+        if ctx.out.len() >= ctx.max_n {
+            return false.into();
+        }
+        if hwnd == ctx.main || !IsWindowVisible(hwnd).as_bool() || window_pid(hwnd) != ctx.pid {
+            return true.into();
+        }
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+        let owned = GetWindow(hwnd, GW_OWNER).is_ok_and(|o| o == ctx.main);
+        if style & WS_POPUP.0 == 0 && !owned {
+            return true.into();
+        }
+        let class = window_class(hwnd);
+        if class == "tooltips_class32" || class.starts_with("Shell_") {
+            return true.into();
+        }
+        match window_rect(hwnd) {
+            Some(r) if r[2] > 0 && r[3] > 0 => ctx.out.push((hwnd, r)),
+            _ => {}
+        }
+        true.into()
+    }
+    let mut ctx = Ctx {
+        pid,
+        main,
+        max_n,
+        out: Vec::new(),
+    };
+    // SAFETY: the callback only touches `ctx` through the pointer we pass here.
+    let _ = unsafe { EnumWindows(Some(cb), LPARAM(&mut ctx as *mut Ctx as isize)) };
+    ctx.out
 }
 
 /// Hide the console when this process is its only owner (the exe was double-clicked);

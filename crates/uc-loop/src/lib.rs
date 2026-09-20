@@ -41,6 +41,9 @@ pub mod consts {
     pub const MAX_STEPS_DEFAULT: usize = 12;
     /// Max candidates sent to Jev (measured stable to 60).
     pub const MAX_CANDIDATES: usize = 60;
+    /// Pop-ups of the target process scanned in addition to the foreground window
+    /// (a menu and its sub-menu, a drop-down, an owned dialog).
+    pub const MAX_POPUPS: usize = 3;
     /// Settle cap after an action (jev-ultrafast: 50 ms / 2 frames; combobox 200 ms).
     /// MVP sleeps this long; phase 1 replaces it with UIA events + hash polling.
     pub const SETTLE_CAP_MS: u64 = 200;
@@ -647,6 +650,55 @@ pub enum LoopError {
     Json(#[from] serde_json::Error),
 }
 
+/// One step's view of the target: the foreground window plus its pop-ups, reduced.
+pub struct Perception {
+    pub scan: uc_uia::Scan,
+    pub reduced: Vec<uc_uia::Element>,
+    /// Pop-up windows of the target process merged into `scan` (menus, drop-downs,
+    /// owned dialogs).
+    pub popups: usize,
+}
+
+/// Scan `scene`'s window and every pop-up of its process, then reduce. Menus,
+/// drop-downs and owned dialogs live in their own top-level windows that never take
+/// the foreground, so a scan of the foreground alone would miss them; the viewport
+/// grows to cover them because a context menu often hangs outside the window.
+pub fn perceive(
+    scanner: &uc_uia::UiaScanner,
+    scene: &uc_win32::Scene,
+    include_context: bool,
+    max_n: usize,
+) -> Perception {
+    let mut scan = scanner.scan_hwnd(scene.hwnd(), include_context);
+    let mut viewport = scene.rect;
+    let mut popups = 0usize;
+    for (h, r) in uc_win32::popups_of(scene.pid, scene.hwnd(), consts::MAX_POPUPS) {
+        let extra = scanner.scan_hwnd(h, include_context);
+        if extra.elements.is_empty() {
+            continue;
+        }
+        popups += 1;
+        scan.raw_count += extra.raw_count;
+        scan.total_ms += extra.total_ms;
+        viewport = uc_win32::rect_union(viewport, r);
+        scan.elements.extend(extra.elements);
+    }
+    let reduced = uc_uia::reduce(
+        &scan.elements,
+        uc_uia::ReduceOpts {
+            max_n,
+            near: Some(scene.cursor),
+            viewport: Some(viewport),
+            ..Default::default()
+        },
+    );
+    Perception {
+        scan,
+        reduced,
+        popups,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RunOpts {
     /// Inject input. Off = show the first decision and stop (preview).
@@ -694,6 +746,9 @@ pub struct StepRecord {
     pub app: String,
     pub title: String,
     pub raw_elements: usize,
+    /// Pop-up windows of the target process (menus, drop-downs, dialogs) merged into
+    /// the scan.
+    pub popups: usize,
     pub sent_elements: usize,
     pub est_tokens: usize,
     pub tree_hash: u64,
@@ -850,16 +905,11 @@ impl Runner {
                 }
                 Some(_) => {}
             }
-            let scan = self.scanner.scan_hwnd(scene.hwnd(), false);
-            let reduced = uc_uia::reduce(
-                &scan.elements,
-                uc_uia::ReduceOpts {
-                    max_n: consts::MAX_CANDIDATES,
-                    near: Some(scene.cursor),
-                    viewport: Some(scene.rect),
-                    ..Default::default()
-                },
-            );
+            let Perception {
+                scan,
+                reduced,
+                popups,
+            } = perceive(&self.scanner, &scene, false, consts::MAX_CANDIDATES);
             let hash = uc_uia::tree_hash(&reduced);
             let scan_ms = ms(t0);
 
@@ -984,6 +1034,7 @@ impl Runner {
                 app: scene.app.clone(),
                 title: scene.title.clone(),
                 raw_elements: scan.raw_count,
+                popups,
                 sent_elements: reduced.len(),
                 est_tokens,
                 tree_hash: hash,
