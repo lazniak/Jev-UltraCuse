@@ -1,0 +1,10 @@
+[package]
+name = "uc-shell"
+description = "One warm PowerShell session per run: commands over stdin, sentinel-delimited output, Tier-0 guards."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+base64 = { workspace = true }

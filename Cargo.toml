@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "ultracuse"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/hexart/Jev-UltraCuse"
+
+[workspace.dependencies]
+# Pinned: `windows` 0.62 is the current stable line; 0.100 is a future breaking rewrite (ADR-001).
+windows = "0.62"
+windows-core = "0.62"
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "io-util", "process"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "json"] }
+clap = { version = "4", features = ["derive"] }
+base64 = "0.22"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+opt-level = 3
+strip = true
+
+[profile.dev]
+opt-level = 1

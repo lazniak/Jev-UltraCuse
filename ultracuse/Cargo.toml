@@ -1,0 +1,21 @@
+[package]
+name = "ultracuse"
+description = "Jev-UltraCuse — voice-first, Jev-decided Computer Use for Windows as one portable exe."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ultracuse"
+path = "src/main.rs"
+
+[dependencies]
+uc-win32 = { path = "../crates/uc-win32" }
+uc-uia = { path = "../crates/uc-uia" }
+uc-input = { path = "../crates/uc-input" }
+uc-shell = { path = "../crates/uc-shell" }
+uc-jev = { path = "../crates/uc-jev" }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }

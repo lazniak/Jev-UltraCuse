@@ -1,0 +1,20 @@
+[package]
+name = "uc-uia"
+description = "UI Automation perception on raw COM: one FindAllBuildCache + CacheRequest per step, GuiState, reduction, hashing."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+uc-win32 = { path = "../uc-win32" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+xxhash-rust = { workspace = true }
+windows-core = { workspace = true }
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_UI_Accessibility",
+] }

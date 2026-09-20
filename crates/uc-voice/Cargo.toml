@@ -1,0 +1,9 @@
+[package]
+name = "uc-voice"
+description = "Microphone capture, VAD and streaming STT feeding the intent fan-out (engine per ADR-002)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }

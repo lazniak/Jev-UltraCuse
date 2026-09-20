@@ -1,0 +1,26 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Python (lab)
+__pycache__/
+.venv/
+*.pyc
+
+# sekrety / runtime
+.env
+*.key
+config.local.*
+/runs/
+/models/
+*.onnx
+*.bin
+*.gguf
+
+# graphify
+/graphify-out/
+
+# IDE
+.idea/
+.vscode/
+*.swp

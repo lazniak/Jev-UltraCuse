@@ -1,0 +1,4 @@
+{"bench": "R1-uia-python", "hwnd": 35785662, "title": "*pyproject.toml — Notatnik", "raw_count": 101, "kept": 31, "error": null, "total_ms": {"min": 378.8, "p50": 387.9, "p95": 432.2, "max": 449.6}, "date": "2026-09-20"}
+{"bench": "R1-uia-python", "hwnd": 462538, "title": "Issues · lazniak/jevskill - Google Chrome", "raw_count": 145, "kept": 126, "error": null, "total_ms": {"min": 100.4, "p50": 106.1, "p95": 121.7, "max": 143.6}, "date": "2026-09-20"}
+{"bench": "R1-uia-python", "hwnd": 396008, "title": "Claude", "raw_count": 783, "kept": 160, "error": null, "total_ms": {"min": 455.0, "p50": 478.1, "p95": 581.7, "max": 605.2}, "date": "2026-09-20"}
+{"bench": "R1-uia-python", "hwnd": 3280404, "title": "MLRC Projector", "raw_count": 0, "kept": 0, "error": null, "total_ms": {"min": 183.3, "p50": 216.8, "p95": 233.5, "max": 237.2}, "date": "2026-09-20"}

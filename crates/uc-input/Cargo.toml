@@ -1,0 +1,17 @@
+[package]
+name = "uc-input"
+description = "Input injection as a HID device would do it: one SendInput per action (move+click, chord, text), scan codes, clipboard paste."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+uc-win32 = { path = "../uc-win32" }
+thiserror = { workspace = true }
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+] }
