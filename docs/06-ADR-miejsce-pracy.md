@@ -33,10 +33,11 @@ MVP-1 blokował przebieg na procesie okna docelowego: inne okno na wierzchu = `F
 - Lista nieodwracalnych, `is_destructive`, `--allow-irreversible`, bramki System Two — bez zmian.
 - Tylko wejście (`click`/`type`/`key`) i akcje okienne mogą przenieść fokus: nowe okno na wierzchu po `wait` albo `scroll` to przemieszczenie przez użytkownika, nie skutek pętli.
 - Odmowa menedżera okien (`SetForegroundWindow`, `ShowWindow` przy blokadzie fokusu, oknie podniesionym lub zamkniętym) = krok bez efektu, nie koniec przebiegu; szczebel zostaje, więc drabina idzie dalej.
-- Okno raz odwiedzone przez `Switch` (skąd i dokąd) nie jest ponownie celem `Switch` w tym przebiegu — ping-pong A → B → A kończy się na kolejnym szczeblu, nie na budżecie kroków.
+- Okno może być celem `Switch` najwyżej `SWITCH_MAX_VISITS` = 2 razy w przebiegu: wycieczka A → B → A (skopiuj tam, wklej tu) przechodzi, ping-pong kończy się na kolejnym szczeblu, nie na budżecie kroków.
+- Własne okno aplikacji na wierzchu nigdy nie jest miejscem pracy (AccessKit wystawiłby Jevowi nasz Start/Stop): pętla czeka; 3 kroki z rzędu → `FocusLost`.
 - Krok przeglądu nie skanuje UIA — do dostawcy idą **tytuły i exe wszystkich otwartych okien** (≤ 24), więcej niż dawny tytuł jednego okna; bez elementów, bez treści. To jedyny nowy wyciek informacji tej decyzji.
 - Tryb podglądu w oknie aplikacji nie dotyka okien użytkownika: bez `show_desktop` przed startem, `Switch`/`ShowDesktop` tylko pokazane.
-- Ledger: `StepRecord.widen` (szczebel kroku), `StepRecord.survey` (top-3 przeglądu z tytułami), `last.effect` z przejęciami okien, `last.minimized` po `ShowDesktop`.
+- Ledger: `StepRecord.widen` (szczebel kroku), `StepRecord.survey` (top-3 przeglądu z tytułami), `last.effect` z przejęciami okien, `StepRecord.minimized` po `ShowDesktop`, `StepRecord.refused` przy odmowie menedżera okien. Ledgery (`runs/`, poza gitem) zawierają odtąd tytuły wszystkich otwartych okien z kroku przeglądu — kopie do `bench/` przeglądać przed commitem.
 
 ## Odrzucone
 

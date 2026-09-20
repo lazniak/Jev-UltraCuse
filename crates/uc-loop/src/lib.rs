@@ -46,6 +46,9 @@ pub mod consts {
     /// Foreground changes the loop did not cause (the user keeps taking the mouse
     /// back) before the run stops.
     pub const DISPLACED_STRIKES: u32 = 3;
+    /// `Switch` visits per window and run: a second visit allows a round trip (copy
+    /// there, paste back); a third is a ping-pong the survey refuses.
+    pub const SWITCH_MAX_VISITS: u32 = 2;
     /// Windows minimized at most to reach the desktop.
     pub const SHOW_DESKTOP_MAX: usize = 8;
     /// Windows listed in a survey (front-most first).
@@ -439,9 +442,10 @@ pub mod policy {
         }
         let target_el = parse_target(&s.target).and_then(|i| find(els, i));
         // The synthetic background stands for a spot to (right-)click; typing or
-        // scrolling "at" it would land on whatever is really there.
+        // scrolling "at" it would land on whatever is really there. (`key` and `wait`
+        // do not use the target, so they pass.)
         if target_el.is_some_and(|e| e.name == BACKGROUND_NAME)
-            && !matches!(s.op.as_str(), "click" | "right_click")
+            && matches!(s.op.as_str(), "type" | "scroll_up" | "scroll_down")
         {
             return unsure(format!("op {} on the background", s.op));
         }
@@ -671,7 +675,7 @@ pub mod policy {
 /// work go on?". The desktop is its own option, because reaching it means minimizing
 /// what covers it, not activating Explorer's hidden window.
 pub mod survey {
-    use super::consts::{q, CONF_FLOOR, TOP2_GAP_MIN};
+    use super::consts::{q, CONF_FLOOR, SWITCH_MAX_VISITS, TOP2_GAP_MIN};
     use serde_json::{json, Value};
     use uc_win32::WindowInfo;
 
@@ -786,14 +790,14 @@ pub mod survey {
     /// Floors: the winner's probability ≥ `CONF_FLOOR` and top-2 gap ≥ `TOP2_GAP_MIN`.
     /// (The element gate uses the model's `confidence` ≈ top-2 margin against the same
     /// floor, which is stricter; with twenty windows a margin floor would starve the
-    /// survey.) `visited`: windows this run already switched to — choosing one again
-    /// is a ping-pong, reported as unsure so the ladder moves on.
+    /// survey.) `exhausted`: windows switched to `SWITCH_MAX_VISITS` times already —
+    /// choosing one again is a ping-pong, reported as unsure so the ladder moves on.
     pub fn judge(
         d: &uc_jev::Decision,
         candidates: &[WindowInfo],
         current_hwnd: isize,
         on_desktop: bool,
-        visited: &[isize],
+        exhausted: &[isize],
     ) -> (Choice, Value) {
         let by_id = |id: &str| {
             id.strip_prefix('w')
@@ -829,8 +833,8 @@ pub mod survey {
             "none" => Choice::Nothing("survey: no open window fits the goal".into()),
             w => match by_id(w) {
                 Some(win) if win.hwnd == current_hwnd => Choice::Stay,
-                Some(win) if visited.contains(&win.hwnd) => Choice::Unsure(format!(
-                    "survey: „{}” was already visited this run",
+                Some(win) if exhausted.contains(&win.hwnd) => Choice::Unsure(format!(
+                    "survey: „{}” was switched to {SWITCH_MAX_VISITS}× already",
                     win.title
                 )),
                 Some(win) => Choice::Switch(win.clone()),
@@ -1056,10 +1060,15 @@ pub fn perceive(
     // main window — after `reduce`, so the candidate cap never drops it, but checked
     // against *every* scanned element (the cap hides most of a busy window), inside
     // the monitor's work area (the desktop window runs under the taskbar).
-    let area = uc_win32::work_area_of(scene.hwnd())
-        .and_then(|wa| uc_win32::rect_intersect(scene.rect, wa))
-        .unwrap_or(scene.rect);
-    if let Some((x, y)) = empty_spot(area, &scan.elements, uc_win32::dpi_of(scene.hwnd())) {
+    // No monitor info: trust the window rect; no overlap with the work area: the window
+    // is off every monitor, so there is no background to click.
+    let area = match uc_win32::work_area_of(scene.hwnd()) {
+        Some(wa) => uc_win32::rect_intersect(scene.rect, wa),
+        None => Some(scene.rect),
+    };
+    if let Some((x, y)) =
+        area.and_then(|a| empty_spot(a, &scan.elements, uc_win32::dpi_of(scene.hwnd())))
+    {
         reduced.push(uc_uia::Element {
             i: reduced.len(),
             role: "pane".into(),
@@ -1178,6 +1187,12 @@ pub struct StepRecord {
     /// The sub-goal Jev was asked about (`k/n: text`) when a System Two plan is active.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subgoal: Option<String>,
+    /// Titles a `ShowDesktop` step minimized, front first.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub minimized: Vec<String>,
+    /// The window manager refused the step's action; nothing changed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
     /// System Two consultations applied or received during this step.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub two: Vec<uc_two::Note>,
@@ -1330,9 +1345,10 @@ impl Runner {
         // Widening rung for the coming step (0 = plain; `consts::WIDEN_*`).
         let mut widen: u8 = 0;
         let mut survey_only = false;
-        // Windows a survey already switched to or from: never a `Switch` target again
-        // this run (A → B → A → … would burn the budget without a stall).
-        let mut visited: Vec<isize> = Vec::new();
+        // `Switch` targets and how often: a round trip is fine, a ping-pong is not.
+        let mut visits: std::collections::HashMap<isize, u32> = Default::default();
+        let own_pid = std::process::id();
+        let mut own_strikes = 0u32;
 
         let outcome = loop {
             if steps >= self.opts.max_steps {
@@ -1349,6 +1365,18 @@ impl Runner {
 
             // 1. Perceive: coarse scene in µs, UIA tree in ms (the app's provider decides).
             let scene = uc_win32::scene().ok_or(LoopError::NoForeground)?;
+            if scene.pid == own_pid {
+                // Our own window in front (the GUI not yet minimized, or restored by the
+                // user): never the place — AccessKit would offer our own Start/Stop to
+                // Jev. Wait a moment; give up when it stays.
+                own_strikes += 1;
+                if own_strikes >= consts::DISPLACED_STRIKES {
+                    break Outcome::FocusLost("own window in front".into());
+                }
+                std::thread::sleep(Duration::from_millis(consts::FOCUS_SETTLE_MS));
+                continue;
+            }
+            own_strikes = 0;
             let mut displaced_now = false;
             match (place_hwnd, place_pid) {
                 (Some(h), Some(pid)) if scene.pid != pid => {
@@ -1503,8 +1531,14 @@ impl Runner {
                 let d = self.rt.block_on(self.client.decide(&bytes, &compiled))?;
                 jev_calls += 1;
                 cost += d.cost_usd;
-                let (choice, note) =
-                    survey::judge(&d, &candidates, scene.hwnd, on_desktop, &visited);
+                let (choice, note) = {
+                    let exhausted: Vec<isize> = visits
+                        .iter()
+                        .filter(|(_, n)| **n >= consts::SWITCH_MAX_VISITS)
+                        .map(|(h, _)| *h)
+                        .collect();
+                    survey::judge(&d, &candidates, scene.hwnd, on_desktop, &exhausted)
+                };
                 survey_note = Some(note);
                 let verdict = match choice {
                     survey::Choice::Stay => {
@@ -1808,6 +1842,8 @@ impl Runner {
                 widen: step_widen,
                 survey: survey_note,
                 subgoal: subgoal_label.clone(),
+                minimized: Vec::new(),
+                refused: None,
                 two: two_notes,
                 sent_elements: reduced.len(),
                 est_tokens,
@@ -1938,6 +1974,7 @@ impl Runner {
                                 rec.executed = true;
                                 let mut summary = action_summary(action);
                                 if !minimized.is_empty() {
+                                    rec.minimized = minimized.clone();
                                     summary["minimized"] = json!(minimized);
                                 }
                                 last = Some(summary);
@@ -1945,11 +1982,8 @@ impl Runner {
                                     action,
                                     policy::Action::Switch { .. } | policy::Action::ShowDesktop
                                 );
-                                if window_op {
-                                    visited.push(scene.hwnd);
-                                }
                                 if let policy::Action::Switch { hwnd, .. } = action {
-                                    visited.push(*hwnd);
+                                    *visits.entry(*hwnd).or_default() += 1;
                                 }
                                 // A new window is a new tree: no stall comparison across it.
                                 last_hash = if window_op { None } else { Some(hash) };
@@ -1978,6 +2012,7 @@ impl Runner {
                                 // or a closed window): a step without effect, not the end
                                 // of the run. The rung stays, so the ladder moves on.
                                 rec.act_ms = ms(t_act);
+                                rec.refused = Some(msg.clone());
                                 last = Some(json!({
                                     "op": "look",
                                     "effect": format!("{msg}; nothing changed"),

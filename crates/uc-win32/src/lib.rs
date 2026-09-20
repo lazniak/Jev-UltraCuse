@@ -369,7 +369,6 @@ pub fn desktop_hwnd() -> Option<HWND> {
 /// injected; every step is a `ShowWindow`, reversible from the taskbar.
 pub fn show_desktop(max_n: usize) -> Vec<String> {
     let mut minimized = Vec::new();
-    let mut prev: Option<HWND> = None;
     for _ in 0..max_n {
         let Some(fg) = foreground_hwnd() else {
             break;
@@ -377,15 +376,15 @@ pub fn show_desktop(max_n: usize) -> Vec<String> {
         if is_shell_class(&window_class(fg)) {
             break;
         }
-        if prev == Some(fg) {
+        let title = window_title(fg);
+        minimize(fg);
+        std::thread::sleep(Duration::from_millis(80));
+        if foreground_hwnd() == Some(fg) {
             // `ShowWindow` was refused (an elevated or topmost window): no progress,
             // so stop instead of spending the budget on the same handle.
             break;
         }
-        prev = Some(fg);
-        minimized.push(window_title(fg));
-        minimize(fg);
-        std::thread::sleep(Duration::from_millis(80));
+        minimized.push(title);
     }
     if let Some(d) = desktop_hwnd() {
         // SAFETY: plain user32 call.

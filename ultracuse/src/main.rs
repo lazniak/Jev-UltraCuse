@@ -667,7 +667,13 @@ fn format_step(r: &uc_loop::StepRecord) -> String {
         Verdict::Act { action } => format!(
             "{}{}",
             describe_action(action),
-            if r.executed { " ✓" } else { " [preview]" }
+            if r.executed {
+                " ✓"
+            } else if r.refused.is_some() {
+                " [refused]"
+            } else {
+                " [preview]"
+            }
         ),
         Verdict::Uncertain { reason, .. } => format!("UNCERTAIN: {reason}"),
         Verdict::NeedsText => "NEEDS TEXT (quote it in the goal or pass --text)".to_string(),
@@ -729,6 +735,12 @@ fn two_lines(r: &uc_loop::StepRecord) -> String {
             })
             .unwrap_or_default();
         out.push_str(&format!("\n    survey: {}", top.join(" | ")));
+    }
+    if let Some(m) = &r.refused {
+        out.push_str(&format!("\n    refused: {m}"));
+    }
+    if !r.minimized.is_empty() {
+        out.push_str(&format!("\n    minimized: {}", r.minimized.join(" | ")));
     }
     if let Some(sg) = &r.subgoal {
         out.push_str(&format!("\n    subgoal {sg}"));

@@ -972,7 +972,13 @@ fn step_card(ui: &mut egui::Ui, r: &StepRecord) {
             format!(
                 "{} {}",
                 action_text(action),
-                if r.executed { "✓" } else { "[podgląd]" }
+                if r.executed {
+                    "✓"
+                } else if r.refused.is_some() {
+                    "[odmowa]"
+                } else {
+                    "[podgląd]"
+                }
             ),
             if r.executed {
                 egui::Color32::from_rgb(120, 180, 255)
@@ -1024,6 +1030,20 @@ fn step_card(ui: &mut egui::Ui, r: &StepRecord) {
         if let Some(sv) = &r.survey {
             ui.label(
                 egui::RichText::new(format!("przegląd okien: {}", survey_text(sv)))
+                    .color(WIDEN_COLOR)
+                    .small(),
+            );
+        }
+        if let Some(m) = &r.refused {
+            ui.label(
+                egui::RichText::new(format!("odmowa: {m}"))
+                    .color(WIDEN_COLOR)
+                    .small(),
+            );
+        }
+        if !r.minimized.is_empty() {
+            ui.label(
+                egui::RichText::new(format!("zminimalizowane: {}", r.minimized.join(" · ")))
                     .color(WIDEN_COLOR)
                     .small(),
             );
