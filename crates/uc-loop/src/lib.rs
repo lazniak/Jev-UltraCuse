@@ -61,9 +61,13 @@ pub mod consts {
     /// Name of the synthetic element that stands for an empty spot of the target
     /// window: the only way to say "right-click the background" (desktop → New…).
     pub const BACKGROUND_NAME: &str = "background (empty area)";
-    /// Caption / tab strip height skipped when looking for an empty spot, px.
+    /// Caption / tab strip height skipped when looking for an empty spot, px at
+    /// 96 DPI (scaled by the window's DPI; the process is per-monitor aware).
     pub const BACKGROUND_TOP_SKIP: i32 = 48;
+    /// Margin kept from the window edges (resize frame) and the halo around every
+    /// element, px at 96 DPI.
     pub const BACKGROUND_MARGIN: i32 = 16;
+    pub const BACKGROUND_HALO: i32 = 12;
     /// System Two (OpenRouter chat model) consultations per run: one plan + rescues.
     pub const TWO_MAX_CALLS: u32 = 3;
     /// How long the loop waits for a rescue when Jev is stuck (kill switch and stop
@@ -172,6 +176,8 @@ pub mod consts {
         pub const NEEDS_TEXT_FALSE: &str = "No typing is needed for the next step.";
         pub const PLACE: &str = "In which of `windows` should the work toward `goal` continue? `current` is the window in front now; `last` says what was just done.";
         pub const PLACE_DESKTOP: &str = "The desktop itself (its icons and background) — every open window is in the way and should be minimized.";
+        pub const PLACE_DESKTOP_HERE: &str =
+            "The desktop itself, which is in front now: stay here.";
         pub const PLACE_NONE: &str =
             "No open window fits `goal`; the application needed is not running.";
         pub const DESTRUCTIVE: &str = "Would the most likely next action delete data, send a message, pay, or otherwise be hard to undo?";
@@ -432,6 +438,13 @@ pub mod policy {
             return unsure(format!("op {} at {:.2} < {CONF_FLOOR}", s.op, s.op_conf));
         }
         let target_el = parse_target(&s.target).and_then(|i| find(els, i));
+        // The synthetic background stands for a spot to (right-)click; typing or
+        // scrolling "at" it would land on whatever is really there.
+        if target_el.is_some_and(|e| e.name == BACKGROUND_NAME)
+            && !matches!(s.op.as_str(), "click" | "right_click")
+        {
+            return unsure(format!("op {} on the background", s.op));
+        }
         let (target_conf, target_gap) = (s.target_conf, s.target_gap);
         let target_ok = target_el.is_some_and(|e| e.enabled)
             && target_conf >= CONF_FLOOR
@@ -674,17 +687,33 @@ pub mod survey {
         Unsure(String),
     }
 
+    /// The window in front when the survey is asked.
+    #[derive(Clone, Copy, Debug)]
+    pub struct Current<'a> {
+        pub hwnd: isize,
+        pub app: &'a str,
+        pub title: &'a str,
+        /// The user moved the foreground here; the loop did not.
+        pub displaced: bool,
+        /// `Progman`/`WorkerW` in front: "desktop" means stay.
+        pub on_desktop: bool,
+    }
+
     /// State + question over the switchable windows (the desktop excluded from the
     /// list, present as the `desktop` option). Returns the candidate list the ids refer to.
     pub fn build(
         goal: &str,
         windows: &[WindowInfo],
-        current_hwnd: isize,
-        current_app: &str,
-        current_title: &str,
+        current: &Current<'_>,
         last: Option<Value>,
-        displaced: bool,
     ) -> (Value, uc_jev::Compiled, Vec<WindowInfo>) {
+        let Current {
+            hwnd: current_hwnd,
+            app: current_app,
+            title: current_title,
+            displaced,
+            on_desktop,
+        } = *current;
         let candidates: Vec<WindowInfo> = windows
             .iter()
             .filter(|w| !w.is_desktop())
@@ -705,7 +734,12 @@ pub mod survey {
             .collect();
         let mut state = json!({
             "goal": goal,
-            "current": {"app": current_app, "title": current_title, "displaced_by_user": displaced},
+            "current": {
+                "app": current_app,
+                "title": current_title,
+                "displaced_by_user": displaced,
+                "is_desktop": on_desktop,
+            },
             "windows": list,
         });
         if let Some(l) = last {
@@ -731,7 +765,14 @@ pub mod survey {
                 )
             })
             .collect();
-        criteria.push(("desktop".into(), q::PLACE_DESKTOP.into()));
+        criteria.push((
+            "desktop".into(),
+            if on_desktop {
+                q::PLACE_DESKTOP_HERE.into()
+            } else {
+                q::PLACE_DESKTOP.into()
+            },
+        ));
         criteria.push(("none".into(), q::PLACE_NONE.into()));
         let pairs: Vec<(&str, String)> = criteria
             .iter()
@@ -742,16 +783,35 @@ pub mod survey {
         (state, uc_jev::Compiled::new(&qs), candidates)
     }
 
-    /// The same floors as for an element: top probability and top-2 gap.
+    /// Floors: the winner's probability ≥ `CONF_FLOOR` and top-2 gap ≥ `TOP2_GAP_MIN`.
+    /// (The element gate uses the model's `confidence` ≈ top-2 margin against the same
+    /// floor, which is stricter; with twenty windows a margin floor would starve the
+    /// survey.) `visited`: windows this run already switched to — choosing one again
+    /// is a ping-pong, reported as unsure so the ladder moves on.
     pub fn judge(
         d: &uc_jev::Decision,
         candidates: &[WindowInfo],
         current_hwnd: isize,
+        on_desktop: bool,
+        visited: &[isize],
     ) -> (Choice, Value) {
-        // `choice()` reports the model's `confidence` (≈ top-2 margin), not the
-        // winner's probability; gate on the distribution itself, like `Signals` does.
+        let by_id = |id: &str| {
+            id.strip_prefix('w')
+                .and_then(|n| n.parse::<usize>().ok())
+                .and_then(|i| candidates.get(i))
+        };
         let top = d.top("place", 3);
-        let note = json!({"top": top});
+        // The ids mean nothing after the step: keep the titles next to them.
+        let labelled: Vec<Value> = top
+            .iter()
+            .map(|(id, p)| {
+                let label = by_id(id)
+                    .map(|w| format!("{} ({})", w.title, w.exe))
+                    .unwrap_or_else(|| id.clone());
+                json!([id, p, label])
+            })
+            .collect();
+        let note = json!({"top": labelled});
         let Some((id, p)) = top.first().cloned() else {
             return (Choice::Unsure("survey: no answer".into()), note);
         };
@@ -764,14 +824,15 @@ pub mod survey {
             );
         }
         let choice = match id {
+            "desktop" if on_desktop => Choice::Stay,
             "desktop" => Choice::Desktop,
             "none" => Choice::Nothing("survey: no open window fits the goal".into()),
-            w => match w
-                .strip_prefix('w')
-                .and_then(|n| n.parse::<usize>().ok())
-                .and_then(|i| candidates.get(i))
-            {
+            w => match by_id(w) {
                 Some(win) if win.hwnd == current_hwnd => Choice::Stay,
+                Some(win) if visited.contains(&win.hwnd) => Choice::Unsure(format!(
+                    "survey: „{}” was already visited this run",
+                    win.title
+                )),
                 Some(win) => Choice::Switch(win.clone()),
                 None => Choice::Unsure(format!("survey: unknown window {w}")),
             },
@@ -794,7 +855,7 @@ pub mod exec {
     /// Inject one action. Every branch is a single `SendInput` batch (plus a clipboard
     /// paste for long text); no allocation happens between the call and the syscall
     /// beyond what `uc-input` already does.
-    pub fn perform(a: &Action) -> Result<(), LoopError> {
+    pub fn perform(a: &Action) -> Result<Vec<String>, LoopError> {
         match a {
             Action::Switch { hwnd, title, .. } => {
                 if !uc_win32::bring_to_front(hwnd_of(*hwnd)) {
@@ -805,13 +866,15 @@ pub mod exec {
                 std::thread::sleep(Duration::from_millis(FOCUS_SETTLE_MS));
             }
             Action::ShowDesktop => {
-                uc_win32::show_desktop(SHOW_DESKTOP_MAX);
+                let minimized = uc_win32::show_desktop(SHOW_DESKTOP_MAX);
                 std::thread::sleep(Duration::from_millis(FOCUS_SETTLE_MS));
+                // `Progman`/`WorkerW` only: the taskbar in front is not the desktop.
                 let on_desktop = uc_win32::foreground_hwnd()
                     .is_some_and(|h| uc_win32::is_desktop_class(&uc_win32::window_class(h)));
                 if !on_desktop {
                     return Err(LoopError::Window("could not reach the desktop".into()));
                 }
+                return Ok(minimized);
             }
             Action::Click { x, y, right, .. } => {
                 uc_input::click(*x, *y, if *right { Button::Right } else { Button::Left }, 1)?;
@@ -836,7 +899,7 @@ pub mod exec {
             }
             Action::Wait => std::thread::sleep(Duration::from_millis(WAIT_MS)),
         }
-        Ok(())
+        Ok(Vec::new())
     }
 }
 
@@ -990,8 +1053,13 @@ pub fn perceive(
     );
     // The background is a target too (context menu of the desktop or of an empty
     // canvas); UIA has no element for it, so one is synthesised at a free spot of the
-    // main window — after `reduce`, so the candidate cap never drops it.
-    if let Some((x, y)) = empty_spot(scene.rect, &reduced) {
+    // main window — after `reduce`, so the candidate cap never drops it, but checked
+    // against *every* scanned element (the cap hides most of a busy window), inside
+    // the monitor's work area (the desktop window runs under the taskbar).
+    let area = uc_win32::work_area_of(scene.hwnd())
+        .and_then(|wa| uc_win32::rect_intersect(scene.rect, wa))
+        .unwrap_or(scene.rect);
+    if let Some((x, y)) = empty_spot(area, &scan.elements, uc_win32::dpi_of(scene.hwnd())) {
         reduced.push(uc_uia::Element {
             i: reduced.len(),
             role: "pane".into(),
@@ -1013,34 +1081,39 @@ pub fn perceive(
 /// A point inside `rect` (below the caption, inside the margins) that no element
 /// covers — the centre first, then a coarse grid ordered by distance from the centre.
 /// `None` when the window is fully covered (a maximised document, a list view).
-pub fn empty_spot(rect: uc_win32::Rect, els: &[uc_uia::Element]) -> Option<(i32, i32)> {
+/// `dpi` scales the 96-DPI constants (caption, margin, halo, grid step).
+pub fn empty_spot(rect: uc_win32::Rect, els: &[uc_uia::Element], dpi: u32) -> Option<(i32, i32)> {
+    let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
+    let px = |v: i32| (v as f32 * scale).round() as i32;
     let [rx, ry, rw, rh] = rect;
-    let m = consts::BACKGROUND_MARGIN;
-    let (x0, y0) = (rx + m, ry + consts::BACKGROUND_TOP_SKIP);
+    let m = px(consts::BACKGROUND_MARGIN);
+    let (x0, y0) = (rx + m, ry + px(consts::BACKGROUND_TOP_SKIP));
     let (x1, y1) = (rx + rw - m, ry + rh - m);
     if x1 <= x0 || y1 <= y0 {
         return None;
     }
+    let halo = px(consts::BACKGROUND_HALO);
     let covered = |x: i32, y: i32| {
         els.iter().any(|e| {
             let [ex, ey, ew, eh] = e.bbox;
-            x >= ex - 12 && x < ex + ew + 12 && y >= ey - 12 && y < ey + eh + 12
+            x >= ex - halo && x < ex + ew + halo && y >= ey - halo && y < ey + eh + halo
         })
     };
     let (cx, cy) = ((x0 + x1) / 2, (y0 + y1) / 2);
     if !covered(cx, cy) {
         return Some((cx, cy));
     }
-    let step = ((x1 - x0) / 12).max(48);
+    let step_x = ((x1 - x0) / 12).max(px(48));
+    let step_y = ((y1 - y0) / 12).max(px(48));
     let mut grid: Vec<(i32, i32)> = Vec::new();
     let mut y = y0;
     while y < y1 {
         let mut x = x0;
         while x < x1 {
             grid.push((x, y));
-            x += step;
+            x += step_x;
         }
-        y += step;
+        y += step_y;
     }
     grid.sort_by_key(|(x, y)| (x - cx).abs() + (y - cy).abs());
     grid.into_iter().find(|&(x, y)| !covered(x, y))
@@ -1257,6 +1330,9 @@ impl Runner {
         // Widening rung for the coming step (0 = plain; `consts::WIDEN_*`).
         let mut widen: u8 = 0;
         let mut survey_only = false;
+        // Windows a survey already switched to or from: never a `Switch` target again
+        // this run (A → B → A → … would burn the budget without a stall).
+        let mut visited: Vec<isize> = Vec::new();
 
         let outcome = loop {
             if steps >= self.opts.max_steps {
@@ -1311,33 +1387,53 @@ impl Runner {
                     }
                 }
                 // A dialog or another window of the same app: the place moves with it.
-                (Some(_), Some(_)) => place_hwnd = Some(scene.hwnd),
+                (Some(_), Some(_)) => {
+                    place_hwnd = Some(scene.hwnd);
+                    displaced = 0;
+                }
                 _ => {
                     place_hwnd = Some(scene.hwnd);
                     place_pid = Some(scene.pid);
+                    displaced = 0;
                 }
             }
             expect_change = false;
+            let survey_step = survey_only;
             let include_context = widen >= consts::WIDEN_CONTEXT;
+            // A survey step asks about windows, not elements: no UIA scan (titles and
+            // exes are all that leaves the machine), and the window the user moved to
+            // is not inspected.
             let Perception {
                 scan,
                 reduced,
                 popups,
-            } = perceive(
-                &self.scanner,
-                &scene,
-                include_context,
-                if include_context {
-                    consts::WIDEN_MAX_CANDIDATES
-                } else {
-                    consts::MAX_CANDIDATES
-                },
-            );
+            } = if survey_step {
+                Perception {
+                    scan: uc_uia::Scan::default(),
+                    reduced: Vec::new(),
+                    popups: 0,
+                }
+            } else {
+                perceive(
+                    &self.scanner,
+                    &scene,
+                    include_context,
+                    if include_context {
+                        consts::WIDEN_MAX_CANDIDATES
+                    } else {
+                        consts::MAX_CANDIDATES
+                    },
+                )
+            };
             let hash = uc_uia::tree_hash(&reduced);
             let scan_ms = ms(t0);
 
             // 2. Did the last action change anything? Code compares states, not Jev.
-            let changed = last_hash.map(|h| h != hash);
+            let changed = if survey_step {
+                None
+            } else {
+                last_hash.map(|h| h != hash)
+            };
             match changed {
                 Some(false) => {
                     if !last_was_wait {
@@ -1389,20 +1485,26 @@ impl Runner {
                 let t_jev = Instant::now();
                 let mut windows = uc_win32::list_windows();
                 windows.truncate(consts::SURVEY_MAX_WINDOWS);
+                let on_desktop =
+                    uc_win32::is_desktop_class(&uc_win32::window_class(hwnd_of(scene.hwnd)));
                 let (state, compiled, candidates) = survey::build(
                     &goal_now,
                     &windows,
-                    scene.hwnd,
-                    &scene.app,
-                    &scene.title,
+                    &survey::Current {
+                        hwnd: scene.hwnd,
+                        app: &scene.app,
+                        title: &scene.title,
+                        displaced: displaced_now,
+                        on_desktop,
+                    },
                     last.clone(),
-                    displaced_now,
                 );
                 let bytes = serde_json::to_vec(&state)?;
                 let d = self.rt.block_on(self.client.decide(&bytes, &compiled))?;
                 jev_calls += 1;
                 cost += d.cost_usd;
-                let (choice, note) = survey::judge(&d, &candidates, scene.hwnd);
+                let (choice, note) =
+                    survey::judge(&d, &candidates, scene.hwnd, on_desktop, &visited);
                 survey_note = Some(note);
                 let verdict = match choice {
                     survey::Choice::Stay => {
@@ -1830,29 +1932,60 @@ impl Runner {
                         last_hash = None;
                     } else {
                         let t_act = Instant::now();
-                        exec::perform(action)?;
-                        rec.act_ms = ms(t_act);
-                        rec.executed = true;
-                        last = Some(action_summary(action));
-                        let window_op = matches!(
-                            action,
-                            policy::Action::Switch { .. } | policy::Action::ShowDesktop
-                        );
-                        // A new window is a new tree: no stall comparison across it.
-                        last_hash = if window_op { None } else { Some(hash) };
-                        expect_change = true;
-                        widen = 0;
-                        displaced = 0;
-                        last_was_wait = matches!(action, policy::Action::Wait);
-                        if last_was_wait {
-                            waits += 1;
-                            if waits >= consts::WAIT_STRIKES {
-                                next = Some(Outcome::Stalled);
+                        match exec::perform(action) {
+                            Ok(minimized) => {
+                                rec.act_ms = ms(t_act);
+                                rec.executed = true;
+                                let mut summary = action_summary(action);
+                                if !minimized.is_empty() {
+                                    summary["minimized"] = json!(minimized);
+                                }
+                                last = Some(summary);
+                                let window_op = matches!(
+                                    action,
+                                    policy::Action::Switch { .. } | policy::Action::ShowDesktop
+                                );
+                                if window_op {
+                                    visited.push(scene.hwnd);
+                                }
+                                if let policy::Action::Switch { hwnd, .. } = action {
+                                    visited.push(*hwnd);
+                                }
+                                // A new window is a new tree: no stall comparison across it.
+                                last_hash = if window_op { None } else { Some(hash) };
+                                // Only input and window ops can move the foreground; a
+                                // wait or a scroll followed by a new window in front is
+                                // the user's doing, and must read as a displacement.
+                                expect_change = !matches!(
+                                    action,
+                                    policy::Action::Wait | policy::Action::Scroll { .. }
+                                );
+                                widen = 0;
+                                displaced = 0;
+                                last_was_wait = matches!(action, policy::Action::Wait);
+                                if last_was_wait {
+                                    waits += 1;
+                                    if waits >= consts::WAIT_STRIKES {
+                                        next = Some(Outcome::Stalled);
+                                    }
+                                } else {
+                                    waits = 0;
+                                }
+                                std::thread::sleep(Duration::from_millis(consts::SETTLE_CAP_MS));
                             }
-                        } else {
-                            waits = 0;
+                            Err(LoopError::Window(msg)) => {
+                                // The window manager refused (foreground lock, an elevated
+                                // or a closed window): a step without effect, not the end
+                                // of the run. The rung stays, so the ladder moves on.
+                                rec.act_ms = ms(t_act);
+                                last = Some(json!({
+                                    "op": "look",
+                                    "effect": format!("{msg}; nothing changed"),
+                                }));
+                                last_hash = None;
+                            }
+                            Err(e) => return Err(e),
                         }
-                        std::thread::sleep(Duration::from_millis(consts::SETTLE_CAP_MS));
                     }
                 }
             }
@@ -2370,16 +2503,25 @@ mod tests {
     #[test]
     fn empty_spot_prefers_centre_then_grid_then_gives_up() {
         let rect = [0, 0, 1000, 800];
-        assert_eq!(empty_spot(rect, &[]), Some((500, 416)));
+        // Margin 16 / caption 48 at 96 DPI: the free area is 16..984 × 48..784.
+        assert_eq!(empty_spot(rect, &[], 96), Some((500, 416)));
+        // Doubled at 192 DPI: 32..968 × 96..768.
+        assert_eq!(empty_spot(rect, &[], 192), Some((500, 432)));
         let mut mid = el(0, "button", "Mid");
         mid.bbox = [400, 350, 200, 150];
+        let (x, y) = empty_spot(rect, &[mid], 96).expect("a free grid point");
         assert!(
-            matches!(empty_spot(rect, &[mid.clone()]), Some((x, y)) if !(388..612).contains(&x) || !(338..512).contains(&y))
+            (16..984).contains(&x) && (48..784).contains(&y),
+            "inside the area"
+        );
+        assert!(
+            !(388..612).contains(&x) || !(338..512).contains(&y),
+            "outside Mid and its halo: ({x}, {y})"
         );
         let mut all = el(1, "document", "Doc");
         all.bbox = [-20, -20, 1040, 840];
-        assert_eq!(empty_spot(rect, &[all]), None);
-        assert_eq!(empty_spot([0, 0, 20, 20], &[]), None);
+        assert_eq!(empty_spot(rect, &[all], 96), None);
+        assert_eq!(empty_spot([0, 0, 20, 20], &[], 96), None);
     }
 
     #[test]
@@ -2397,8 +2539,18 @@ mod tests {
             win(11, "Notatnik", "notepad.exe"),
             win(12, "Poczta", "olk.exe"),
         ];
-        let (state, _compiled, cands) =
-            survey::build("x", &windows, 12, "olk", "Poczta", None, true);
+        let (state, _compiled, cands) = survey::build(
+            "x",
+            &windows,
+            &survey::Current {
+                hwnd: 12,
+                app: "olk",
+                title: "Poczta",
+                displaced: true,
+                on_desktop: false,
+            },
+            None,
+        );
         assert_eq!(cands.len(), 2, "the desktop is an option, not a window");
         assert_eq!(state["windows"][1]["in_front"], true);
         assert_eq!(state["current"]["displaced_by_user"], true);
@@ -2409,24 +2561,35 @@ mod tests {
             }
             uc_jev::Decision::from_probs("place", m)
         };
-        assert!(matches!(
-            survey::judge(&dec(&[("w0", 0.9), ("desktop", 0.1)]), &cands, 12).0,
-            survey::Choice::Switch(w) if w.hwnd == 11
-        ));
+        let judge = |probs: &[(&str, f64)], on_desktop: bool, visited: &[isize]| {
+            survey::judge(&dec(probs), &cands, 12, on_desktop, visited)
+        };
+        let (choice, note) = judge(&[("w0", 0.9), ("desktop", 0.1)], false, &[]);
+        assert!(matches!(choice, survey::Choice::Switch(w) if w.hwnd == 11));
+        assert_eq!(note["top"][0][2], "Notatnik (notepad.exe)", "titles kept");
         assert_eq!(
-            survey::judge(&dec(&[("w1", 0.8), ("w0", 0.2)]), &cands, 12).0,
+            judge(&[("w1", 0.8), ("w0", 0.2)], false, &[]).0,
             survey::Choice::Stay
         );
         assert_eq!(
-            survey::judge(&dec(&[("desktop", 0.7), ("w0", 0.3)]), &cands, 12).0,
+            judge(&[("desktop", 0.7), ("w0", 0.3)], false, &[]).0,
             survey::Choice::Desktop
         );
+        assert_eq!(
+            judge(&[("desktop", 0.7), ("w0", 0.3)], true, &[]).0,
+            survey::Choice::Stay,
+            "already on the desktop: no ShowDesktop no-op"
+        );
         assert!(matches!(
-            survey::judge(&dec(&[("w0", 0.5), ("w1", 0.5)]), &cands, 12).0,
+            judge(&[("w0", 0.9), ("desktop", 0.1)], false, &[11]).0,
             survey::Choice::Unsure(_)
         ));
         assert!(matches!(
-            survey::judge(&dec(&[("none", 0.9), ("w0", 0.1)]), &cands, 12).0,
+            judge(&[("w0", 0.5), ("w1", 0.5)], false, &[]).0,
+            survey::Choice::Unsure(_)
+        ));
+        assert!(matches!(
+            judge(&[("none", 0.9), ("w0", 0.1)], false, &[]).0,
             survey::Choice::Nothing(_)
         ));
     }

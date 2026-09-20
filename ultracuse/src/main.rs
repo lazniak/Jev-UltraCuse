@@ -716,7 +716,19 @@ fn two_lines(r: &uc_loop::StepRecord) -> String {
         out.push_str(&format!("\n    widened: rung {}", r.widen));
     }
     if let Some(sv) = &r.survey {
-        out.push_str(&format!("\n    survey: {}", sv["top"]));
+        let top: Vec<String> = sv["top"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|e| {
+                        let p = e.get(1)?.as_f64()?;
+                        let label = e.get(2).or_else(|| e.get(0))?.as_str()?;
+                        Some(format!("{label} {p:.2}"))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.push_str(&format!("\n    survey: {}", top.join(" | ")));
     }
     if let Some(sg) = &r.subgoal {
         out.push_str(&format!("\n    subgoal {sg}"));

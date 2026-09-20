@@ -8,7 +8,7 @@ MVP-1 blokował przebieg na procesie okna docelowego: inne okno na wierzchu = `F
 
 ## Decyzja
 
-**Miejsce** (`place`) zamiast celu: pętla rusza z okna, w którym użytkownik był przed chwilą (okno: ostatnie aktywne okno nie-nasze albo pulpit; CLI: okno na wierzchu po odliczaniu lub `--hwnd`), i podąża za skutkami **własnych** akcji: dialogi i inne okna tego samego procesu przejmowane po cichu, okno otwarte lub zamknięte kliknięciem — przejęte („focus moved to…" w `last`), przełączenie i pulpit — jawne akcje.
+**Miejsce** (`place`) zamiast celu: pętla rusza z okna, w którym użytkownik był przed chwilą (okno: ostatnie aktywne okno nie-nasze, jeśli wciąż istnieje, inaczej to, co jest na wierzchu po zminimalizowaniu okna aplikacji; CLI: okno na wierzchu po odliczaniu lub `--hwnd`), i podąża za skutkami **własnych** akcji: dialogi i inne okna tego samego procesu przejmowane po cichu, okno otwarte lub zamknięte kliknięciem — przejęte („focus moved to…" w `last`), przełączenie i pulpit — jawne akcje.
 
 **Drabina poszerzania** — jeden szczebel na każdy niepewny krok, zero po każdej wykonanej akcji:
 
@@ -16,7 +16,7 @@ MVP-1 blokował przebieg na procesie okna docelowego: inne okno na wierzchu = `F
 |---|---|---|
 | 0 | okno: kontrolki interaktywne (≤ 60), pop-upy procesu | 1 wywołanie Jev |
 | `WIDEN_CONTEXT` | + etykiety i tekst statyczny (`include_context`), ≤ 120 kandydatów | 1 wywołanie Jev, większy stan |
-| `WIDEN_SURVEY` | **przegląd okien**: tytuły i exe wszystkich otwartych okien (bez UIA), pytanie `place`: które okno, `desktop` (zminimalizować, co zasłania) albo `none`; odpowiedź = akcja `Switch` / `ShowDesktop` albo „zostań" | 1 tanie wywołanie Jev (~200 tok) |
+| `WIDEN_SURVEY` | **przegląd okien**: tytuły i exe wszystkich otwartych okien (bez UIA), pytanie `place`: które okno, `desktop` (zminimalizować, co zasłania) albo `none`; odpowiedź = akcja `Switch` / `ShowDesktop` albo „zostań" | 1 wywołanie Jev, 2.3–2.5 k tokenów przy 24 oknach (R6), bez UIA |
 | `WIDEN_TWO` | ratunek System Two (ADR-003), tylko gdy włączony | 1 wywołanie LLM |
 | dalej | `Outcome::Uncertain` | — |
 
@@ -24,14 +24,19 @@ MVP-1 blokował przebieg na procesie okna docelowego: inne okno na wierzchu = `F
 
 **Przemieszczenie** (fokus zmienił proces bez akcji pętli): żadnej decyzji o elemencie, żadnego wstrzyknięcia w to okno — tylko przegląd okien: „to jest właściwe miejsce" (przejmij), wróć (`Switch`), pulpit. `DISPLACED_STRIKES` = 3 kolejne przemieszczenia → `FocusLost` (użytkownik wciąż zabiera fokus — pętla nie walczy).
 
-**Pulpit** to nie okno: `Program Manager` nigdy nie jest celem `Switch` (inne okna go zasłaniają — klik w ikonę trafiłby w nie). `ShowDesktop` minimalizuje okna z wierzchu po kolei (`ShowWindow`, bez wstrzykiwania, do `SHOW_DESKTOP_MAX` = 8), aż na wierzchu jest `Progman`/`WorkerW`, i aktywuje okno z ikonami (`desktop_hwnd`: `SHELLDLL_DefView` pod `Progman` albo `WorkerW`). Odwracalne z paska zadań.
+**Pulpit** to nie okno: `Program Manager` nigdy nie jest celem `Switch` (inne okna go zasłaniają — klik w ikonę trafiłby w nie). `ShowDesktop` minimalizuje okna z wierzchu po kolei (`ShowWindow`, bez wstrzykiwania, do `SHOW_DESKTOP_MAX` = 8), aż na wierzchu jest `Progman`/`WorkerW`, i aktywuje okno z ikonami (`desktop_hwnd`: `SHELLDLL_DefView` pod `Progman` albo `WorkerW`). Odwracalne z paska zadań. Pasek zadań na wierzchu to **nie** pulpit (jego przyciski byłyby skanowane i klikane); okno, które nie daje się zminimalizować (podniesione uprawnienia, topmost) = brak postępu = stop. Na pulpicie odpowiedź `desktop` znaczy „zostań”, nie kolejne `ShowDesktop`.
 
 ## Co zostaje z bezpieczeństwa
 
 - Wstrzyknięcie tylko w okno, które ten krok skanował: `focus_still_ours(hwnd)` porównuje **uchwyt** okna na wierzchu z uchwytem skanu tuż przed `SendInput` (silniej niż dawny pid). Zmiana w międzyczasie = krok bez akcji, następny krok widzi, dokąd poszedł fokus.
 - `Switch` i `ShowDesktop` to `SetForegroundWindow`/`ShowWindow` — nie wejście; obie akcje przechodzą przez tryb podglądu, kill-switch i Stop jak każda inna.
 - Lista nieodwracalnych, `is_destructive`, `--allow-irreversible`, bramki System Two — bez zmian.
-- Ledger: `StepRecord.widen` (szczebel kroku), `StepRecord.survey` (top-3 przeglądu), `last.effect` z przejęciami okien.
+- Tylko wejście (`click`/`type`/`key`) i akcje okienne mogą przenieść fokus: nowe okno na wierzchu po `wait` albo `scroll` to przemieszczenie przez użytkownika, nie skutek pętli.
+- Odmowa menedżera okien (`SetForegroundWindow`, `ShowWindow` przy blokadzie fokusu, oknie podniesionym lub zamkniętym) = krok bez efektu, nie koniec przebiegu; szczebel zostaje, więc drabina idzie dalej.
+- Okno raz odwiedzone przez `Switch` (skąd i dokąd) nie jest ponownie celem `Switch` w tym przebiegu — ping-pong A → B → A kończy się na kolejnym szczeblu, nie na budżecie kroków.
+- Krok przeglądu nie skanuje UIA — do dostawcy idą **tytuły i exe wszystkich otwartych okien** (≤ 24), więcej niż dawny tytuł jednego okna; bez elementów, bez treści. To jedyny nowy wyciek informacji tej decyzji.
+- Tryb podglądu w oknie aplikacji nie dotyka okien użytkownika: bez `show_desktop` przed startem, `Switch`/`ShowDesktop` tylko pokazane.
+- Ledger: `StepRecord.widen` (szczebel kroku), `StepRecord.survey` (top-3 przeglądu z tytułami), `last.effect` z przejęciami okien, `last.minimized` po `ShowDesktop`.
 
 ## Odrzucone
 
@@ -40,6 +45,6 @@ MVP-1 blokował przebieg na procesie okna docelowego: inne okno na wierzchu = `F
 - **Kontynuacja po przemieszczeniu bez pytania** — pętla wpisywałaby tekst w okno, do którego użytkownik właśnie przeszedł (incydent z Chrome przy MVP-1).
 - **Stały wybór okna w GUI** — użytkownik nie chce wskazywać; przegląd okien naprawia zły start (dwa przebiegi na oknie czatu z 2026-09-21).
 
-## Pomiar (do zrobienia, `bench/R6-widen.md`)
+## Pomiar
 
-Te same zadania co R4 plus „stwórz na pulpicie plik" i „zamknij kartę" **startowane z niewłaściwego okna**: odsetek sukcesu, liczba kroków, liczba wywołań Jev na szczebel, koszt; przypadki `FocusLost` z realnym przejęciem fokusu przez użytkownika.
+`bench/R6-widen.md` (2026-09-21, podgląd, start z Notatnika): trzy szczeble potwierdzone na żywo — kontekst, `Switch` na FileZilla (1.00), `desktop` (0.70); 2 kroki i 2 wywołania Jev na przebieg, $0.0002–0.0004. Do zrobienia: to samo z `--act`, przemieszczenie przez użytkownika i `FocusLost`, szczebel System Two.

@@ -256,26 +256,16 @@ impl App {
         !self.running() && !self.goal.trim().is_empty()
     }
 
-    /// Where the run starts: the window the user was in before coming here, or the
-    /// desktop when there is none.
+    /// Where the run starts: the window the user was in before coming here, if it
+    /// still exists. `None` = whatever is in front once this window is minimized.
     fn start_window(&self) -> Option<WindowInfo> {
-        self.last_active.clone().or_else(|| {
-            uc_win32::desktop_hwnd().map(|h| WindowInfo {
-                hwnd: h.0 as isize,
-                title: "Program Manager".into(),
-                exe: "explorer.exe".into(),
-                pid: uc_win32::window_pid(h),
-                minimized: false,
-            })
-        })
+        self.last_active
+            .clone()
+            .filter(|w| uc_win32::is_window(uc_win32::HWND(w.hwnd as *mut core::ffi::c_void)))
     }
 
     fn start(&mut self, ctx: &egui::Context) {
-        let Some(win) = self.start_window() else {
-            self.error =
-                Some("Nie widzę żadnego okna ani pulpitu, od którego można zacząć.".into());
-            return;
-        };
+        let win = self.start_window();
         let goal = self.goal.trim().to_string();
         let dictated = if self.text.trim().is_empty() {
             uc_loop::extract_quoted(&goal)
@@ -309,7 +299,7 @@ impl App {
             dictated,
             ledger_dir: Some("runs".into()),
             provider,
-            start_hwnd: Some(win.hwnd),
+            start_hwnd: win.as_ref().map(|w| w.hwnd),
             stop: Some(self.stop.clone()),
             two,
         };
@@ -318,14 +308,17 @@ impl App {
         self.summary = None;
         self.error = None;
         self.state = State::Starting;
-        self.status = format!("start: {}", window_label(&win, 40));
+        self.status = match &win {
+            Some(w) => format!("start: {}", window_label(w, 40)),
+            None => "start: okno na wierzchu".into(),
+        };
         // Out of the way: the run works where the user was, not here.
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         let (tx, rx) = mpsc::channel::<Msg>();
         self.rx = Some(rx);
         let ctx = ctx.clone();
-        let hwnd = win.hwnd;
-        let to_desktop = win.is_desktop();
+        let start = win.as_ref().map(|w| (w.hwnd, w.is_desktop()));
+        let armed = self.act;
         let spawned = std::thread::Builder::new()
             .name("uc-run".into())
             .spawn(move || {
@@ -353,13 +346,20 @@ impl App {
                     ctx_step.request_repaint();
                 }));
                 std::thread::sleep(Duration::from_millis(250));
-                if to_desktop {
-                    uc_win32::show_desktop(uc_loop::consts::SHOW_DESKTOP_MAX);
-                } else if !uc_win32::bring_to_front(uc_win32::HWND(hwnd as *mut core::ffi::c_void))
-                {
-                    return send(Msg::Error(
-                        "nie udało się wysunąć okna startowego na wierzch".into(),
-                    ));
+                if let Some((hwnd, to_desktop)) = start {
+                    if to_desktop {
+                        // Preview never touches the user's windows; armed, clear the
+                        // desktop the way the loop would.
+                        if armed {
+                            uc_win32::show_desktop(uc_loop::consts::SHOW_DESKTOP_MAX);
+                        }
+                    } else {
+                        // Refused (foreground lock) or gone: the run starts from whatever
+                        // is in front — the first step sees the difference and surveys.
+                        let _ = uc_win32::bring_to_front(uc_win32::HWND(
+                            hwnd as *mut core::ffi::c_void,
+                        ));
+                    }
                 }
                 match runner.run(&goal) {
                     Ok(s) => send(Msg::Done(Box::new(s))),
@@ -396,6 +396,7 @@ impl App {
                 self.state = State::Finished;
                 self.error
                     .get_or_insert_with(|| "wątek pętli zakończył się bez wyniku".into());
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             }
         }
         if self.last_poll.elapsed() >= Duration::from_millis(POLL_MS) {
@@ -591,7 +592,10 @@ impl App {
                         ui.label(egui::RichText::new(format!("pid {}", w.pid)).weak().small());
                     }
                     None => {
-                        ui.label(egui::RichText::new("brak okna — zacznę od pulpitu").weak());
+                        ui.label(
+                            egui::RichText::new("to, co będzie na wierzchu po zminimalizowaniu tego okna")
+                                .weak(),
+                        );
                     }
                 }
             });
@@ -870,7 +874,7 @@ fn install_fonts(ctx: &egui::Context) {
 /// How a window is named in the picker: the desktop gets its own name instead of
 /// Explorer's internal "Program Manager".
 fn window_label(w: &WindowInfo, max: usize) -> String {
-    if w.exe.eq_ignore_ascii_case("explorer.exe") && w.title == "Program Manager" {
+    if w.is_desktop() {
         return "Pulpit (explorer.exe)".into();
     }
     format!("{} ({})", short(&w.title, max), w.exe)
@@ -947,11 +951,10 @@ fn survey_text(v: &serde_json::Value) -> String {
         .map(|a| {
             a.iter()
                 .filter_map(|e| {
-                    Some(format!(
-                        "{} {:.2}",
-                        e.get(0)?.as_str()?,
-                        e.get(1)?.as_f64()?
-                    ))
+                    let id = e.get(0)?.as_str()?;
+                    let p = e.get(1)?.as_f64()?;
+                    let label = e.get(2).and_then(|l| l.as_str()).unwrap_or(id);
+                    Some(format!("{} {:.2}", short(label, 28), p))
                 })
                 .collect::<Vec<_>>()
                 .join(" · ")

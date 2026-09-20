@@ -10,12 +10,15 @@ use windows::core::{w, BOOL, PCWSTR, PWSTR};
 pub use windows::Win32::Foundation::HWND;
 use windows::Win32::Foundation::{CloseHandle, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+};
 use windows::Win32::System::Console::{GetConsoleProcessList, GetConsoleWindow};
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::HiDpi::{
-    SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -292,9 +295,51 @@ pub fn minimize(hwnd: HWND) {
     }
 }
 
-/// Window classes that *are* the desktop (or the shell surface in front of it).
+/// Window classes that *are* the desktop: the icon host and its wallpaper worker.
 pub fn is_desktop_class(class: &str) -> bool {
-    matches!(class, "Progman" | "WorkerW" | "Shell_TrayWnd")
+    matches!(class, "Progman" | "WorkerW")
+}
+
+/// Shell surfaces that are never minimized: the desktop and the taskbars. The taskbar
+/// in front is *not* the desktop (its buttons would be scanned and clicked).
+pub fn is_shell_class(class: &str) -> bool {
+    is_desktop_class(class) || matches!(class, "Shell_TrayWnd" | "Shell_SecondaryTrayWnd")
+}
+
+/// The window's DPI (96 = 100 %); 96 when the handle is gone.
+pub fn dpi_of(hwnd: HWND) -> u32 {
+    // SAFETY: pure query; returns 0 for an invalid handle.
+    match unsafe { GetDpiForWindow(hwnd) } {
+        0 => 96,
+        d => d,
+    }
+}
+
+/// Work area `[x, y, w, h]` of the monitor the window is on (the taskbar excluded).
+pub fn work_area_of(hwnd: HWND) -> Option<Rect> {
+    // SAFETY: `MonitorFromWindow` with DEFAULTTONEAREST always yields a monitor;
+    // `GetMonitorInfoW` writes into a struct whose `cbSize` is set.
+    unsafe {
+        let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(mon, &mut info).as_bool() {
+            return None;
+        }
+        let r = info.rcWork;
+        Some([r.left, r.top, r.right - r.left, r.bottom - r.top])
+    }
+}
+
+/// Intersection of two `[x, y, w, h]` rectangles; `None` when they do not overlap.
+pub fn rect_intersect(a: Rect, b: Rect) -> Option<Rect> {
+    let x0 = a[0].max(b[0]);
+    let y0 = a[1].max(b[1]);
+    let x1 = (a[0] + a[2]).min(b[0] + b[2]);
+    let y1 = (a[1] + a[3]).min(b[1] + b[3]);
+    (x1 > x0 && y1 > y0).then_some([x0, y0, x1 - x0, y1 - y0])
 }
 
 /// The window that hosts the desktop icons (`SHELLDLL_DefView`): `Progman`, or the
@@ -324,13 +369,20 @@ pub fn desktop_hwnd() -> Option<HWND> {
 /// injected; every step is a `ShowWindow`, reversible from the taskbar.
 pub fn show_desktop(max_n: usize) -> Vec<String> {
     let mut minimized = Vec::new();
+    let mut prev: Option<HWND> = None;
     for _ in 0..max_n {
         let Some(fg) = foreground_hwnd() else {
             break;
         };
-        if is_desktop_class(&window_class(fg)) {
+        if is_shell_class(&window_class(fg)) {
             break;
         }
+        if prev == Some(fg) {
+            // `ShowWindow` was refused (an elevated or topmost window): no progress,
+            // so stop instead of spending the budget on the same handle.
+            break;
+        }
+        prev = Some(fg);
         minimized.push(window_title(fg));
         minimize(fg);
         std::thread::sleep(Duration::from_millis(80));
