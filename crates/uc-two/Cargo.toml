@@ -1,0 +1,14 @@
+[package]
+name = "uc-two"
+description = "System Two: an OpenRouter chat model consulted beside the Jev loop (plan, rescue, text) without blocking it."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+uc-jev = { path = "../uc-jev" }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }

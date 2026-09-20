@@ -5,6 +5,7 @@
 //! one"), the loop brings it to the front and locks onto its process. The loop itself is
 //! untouched — this is the same `uc_loop::Runner` the CLI uses.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
@@ -12,12 +13,64 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use eframe::egui;
+use serde::{Deserialize, Serialize};
 use uc_loop::policy::{Action, Verdict};
 use uc_loop::{Outcome, RunOpts, RunSummary, Runner, StepRecord};
+use uc_two::ModelInfo;
 use uc_win32::WindowInfo;
 
 const WINDOW_TITLE: &str = "Jev-UltraCuse";
 const POLL_MS: u64 = 250;
+/// Settings live next to the exe (portable); never the API keys — those stay in env.
+const SETTINGS_FILE: &str = "ultracuse.settings.json";
+const MODEL_LIST_MAX: usize = 60;
+const TWO_COLOR: egui::Color32 = egui::Color32::from_rgb(200, 160, 255);
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct Settings {
+    provider: String,
+    max_steps: usize,
+    two_enabled: bool,
+    two_model: String,
+    two_favorites: Vec<String>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            provider: "auto".into(),
+            max_steps: uc_loop::consts::MAX_STEPS_DEFAULT,
+            two_enabled: false,
+            two_model: uc_loop::consts::TWO_DEFAULT_MODEL.into(),
+            two_favorites: vec![
+                uc_loop::consts::TWO_DEFAULT_MODEL.into(),
+                "openai/gpt-4.1-mini".into(),
+                "anthropic/claude-haiku-4.5".into(),
+            ],
+        }
+    }
+}
+
+impl Settings {
+    fn path() -> PathBuf {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join(SETTINGS_FILE)))
+            .unwrap_or_else(|| PathBuf::from(SETTINGS_FILE))
+    }
+    fn load() -> Self {
+        std::fs::read_to_string(Self::path())
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default()
+    }
+    fn save(&self) {
+        if let Ok(t) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(Self::path(), t);
+        }
+    }
+}
 
 pub fn run_ui() -> Result<()> {
     uc_win32::hide_own_console();
@@ -37,7 +90,11 @@ pub fn run_ui() -> Result<()> {
 }
 
 enum Msg {
-    Ready { provider: String, warm_ms: f64 },
+    Ready {
+        provider: String,
+        warm_ms: f64,
+        two: Option<String>,
+    },
     Step(Box<StepRecord>),
     Done(Box<RunSummary>),
     Error(String),
@@ -79,6 +136,13 @@ struct App {
     last_poll: Instant,
     show_settings: bool,
     own_pid: u32,
+    settings: Settings,
+    /// OpenRouter catalogue for the model picker (fetched on demand, in a thread).
+    models: Option<Vec<ModelInfo>>,
+    models_rx: Option<Receiver<Result<Vec<ModelInfo>, String>>>,
+    models_err: Option<String>,
+    model_filter: String,
+    two_key: Option<&'static str>,
 }
 
 impl App {
@@ -91,13 +155,19 @@ impl App {
             }
             s.spacing.item_spacing = egui::vec2(8.0, 8.0);
         });
+        let settings = Settings::load();
+        let provider = match settings.provider.as_str() {
+            "typesafe" => ProviderChoice::Typesafe,
+            "openrouter" => ProviderChoice::OpenRouter,
+            _ => ProviderChoice::Auto,
+        };
         Self {
             goal: String::new(),
             text: String::new(),
             act: false,
             allow_irreversible: false,
-            max_steps: uc_loop::consts::MAX_STEPS_DEFAULT,
-            provider: ProviderChoice::Auto,
+            max_steps: settings.max_steps.clamp(1, 40),
+            provider,
             windows: uc_win32::list_windows(),
             target: None,
             last_active: None,
@@ -112,7 +182,73 @@ impl App {
             last_poll: Instant::now(),
             show_settings: false,
             own_pid: std::process::id(),
+            settings,
+            models: None,
+            models_rx: None,
+            models_err: None,
+            model_filter: String::new(),
+            two_key: uc_two::Config::key_available(),
         }
+    }
+
+    fn save_settings(&mut self) {
+        self.settings.provider = match self.provider {
+            ProviderChoice::Auto => "auto",
+            ProviderChoice::Typesafe => "typesafe",
+            ProviderChoice::OpenRouter => "openrouter",
+        }
+        .into();
+        self.settings.max_steps = self.max_steps;
+        self.settings.save();
+    }
+
+    /// Fetch OpenRouter's catalogue once, off the UI thread.
+    fn fetch_models(&mut self) {
+        if self.models_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.models_rx = Some(rx);
+        self.models_err = None;
+        std::thread::spawn(move || {
+            let key = uc_two::Config::key_available().and_then(uc_jev::user_env);
+            let _ = tx.send(uc_two::list_models(key.as_deref()).map_err(|e| e.to_string()));
+        });
+    }
+
+    fn poll_models(&mut self) {
+        let Some(rx) = &self.models_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(list)) => {
+                self.models = Some(list);
+                self.models_rx = None;
+            }
+            Ok(Err(e)) => {
+                self.models_err = Some(e);
+                self.models_rx = None;
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.models_err = Some("wątek listy modeli zakończył się bez wyniku".into());
+                self.models_rx = None;
+            }
+        }
+    }
+
+    fn model_price(&self, id: &str) -> Option<String> {
+        let m = self.models.as_ref()?.iter().find(|m| m.id == id)?;
+        Some(if m.is_free() {
+            "darmowy".into()
+        } else {
+            format!(
+                "${:.2} / ${:.2} za Mtok · {}k ctx",
+                m.prompt_usd_per_mtok,
+                m.completion_usd_per_mtok,
+                m.context_length / 1000
+            )
+        })
     }
 
     fn running(&self) -> bool {
@@ -149,6 +285,21 @@ impl App {
             ProviderChoice::Typesafe => Some(uc_jev::Provider::Typesafe),
             ProviderChoice::OpenRouter => Some(uc_jev::Provider::OpenRouter),
         };
+        let two = if self.settings.two_enabled {
+            match uc_two::Config::discover(
+                &self.settings.two_model,
+                uc_loop::consts::TWO_MAX_CALLS,
+                Duration::from_millis(uc_loop::consts::TWO_TIMEOUT_MS),
+            ) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    self.error = Some(format!("System Two: {e}"));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         let opts = RunOpts {
             act: self.act,
             max_steps: self.max_steps,
@@ -159,6 +310,7 @@ impl App {
             target_pid: Some(win.pid),
             target_hwnd: Some(win.hwnd),
             stop: Some(self.stop.clone()),
+            two,
         };
         self.stop.store(false, Ordering::Relaxed);
         self.steps.clear();
@@ -188,6 +340,7 @@ impl App {
                 send(Msg::Ready {
                     provider: format!("{:?}", runner.provider()),
                     warm_ms,
+                    two: runner.two_model().map(str::to_string),
                 });
                 let tx_step = tx.clone();
                 let ctx_step = ctx.clone();
@@ -277,9 +430,16 @@ impl App {
 
     fn handle(&mut self, m: Msg, ctx: &egui::Context) {
         match m {
-            Msg::Ready { provider, warm_ms } => {
+            Msg::Ready {
+                provider,
+                warm_ms,
+                two,
+            } => {
                 self.state = State::Running;
-                self.status = format!("{provider}, rozgrzewka {warm_ms:.0} ms — działa");
+                self.status = match two {
+                    Some(m) => format!("{provider}, rozgrzewka {warm_ms:.0} ms · System Two: {m}"),
+                    None => format!("{provider}, rozgrzewka {warm_ms:.0} ms — działa"),
+                };
             }
             Msg::Step(r) => self.steps.push(*r),
             Msg::Done(s) => {
@@ -342,10 +502,28 @@ impl eframe::App for App {
                             s.jev_calls,
                             s.cost_usd
                         ));
+                        if s.two_calls > 0 {
+                            ui.colored_label(
+                                TWO_COLOR,
+                                format!(
+                                    "· System Two {}: {} wywołań · ${:.4}",
+                                    s.two_model.as_deref().unwrap_or("?"),
+                                    s.two_calls,
+                                    s.two_cost_usd
+                                ),
+                            );
+                        }
                         if let Some(p) = &s.ledger {
                             ui.label(egui::RichText::new(format!("· {}", p.display())).weak());
                         }
                     });
+                    if let Some(plan) = &s.plan {
+                        ui.label(
+                            egui::RichText::new(format!("plan: {}", plan.join(" → ")))
+                                .color(TWO_COLOR)
+                                .small(),
+                        );
+                    }
                 }
                 None => {
                     ui.label(
@@ -498,32 +676,199 @@ impl App {
     }
 
     fn settings_modal(&mut self, ctx: &egui::Context) {
+        self.poll_models();
+        if self.models.is_none() && self.models_err.is_none() {
+            self.fetch_models();
+        }
+        let mut close = false;
         let modal = egui::Modal::new(egui::Id::new("settings")).show(ctx, |ui| {
-            ui.set_width(380.0);
+            ui.set_width(540.0);
             ui.heading("Ustawienia");
             ui.separator();
             ui.label(egui::RichText::new("Końcówka Jev").strong());
-            ui.radio_value(&mut self.provider, ProviderChoice::Auto, "auto (vendor, gdy jest JEV_API_KEY)");
-            ui.radio_value(&mut self.provider, ProviderChoice::Typesafe, "TypeSafe (api.typesafe.ai)");
-            ui.radio_value(&mut self.provider, ProviderChoice::OpenRouter, "OpenRouter (typesafe/jev-1.13)");
-            ui.separator();
-            ui.label(egui::RichText::new("System Two (LLM z OpenRouter)").strong());
-            ui.label(
-                egui::RichText::new(
-                    "Równoległy LLM do planu i tekstu, z wyborem modelu — w przygotowaniu (TASKS 3.4).",
-                )
-                .weak(),
+            ui.radio_value(
+                &mut self.provider,
+                ProviderChoice::Auto,
+                "auto (vendor, gdy jest JEV_API_KEY)",
             );
+            ui.radio_value(
+                &mut self.provider,
+                ProviderChoice::Typesafe,
+                "TypeSafe (api.typesafe.ai)",
+            );
+            ui.radio_value(
+                &mut self.provider,
+                ProviderChoice::OpenRouter,
+                "OpenRouter (typesafe/jev-1.13)",
+            );
+            ui.separator();
+            self.two_section(ui);
             ui.separator();
             ui.label(egui::RichText::new("Skróty").strong());
             ui.label("Ctrl+Enter start · Esc stop · Ctrl+Alt+K kill-switch");
             ui.add_space(6.0);
             if ui.button("Zamknij").clicked() {
-                self.show_settings = false;
+                close = true;
             }
         });
-        if modal.should_close() {
+        if close || modal.should_close() {
             self.show_settings = false;
+            self.save_settings();
+        }
+    }
+
+    /// System Two: on/off, the model (searchable catalogue + favourites), key status.
+    fn two_section(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("System Two (LLM z OpenRouter, obok pętli Jev)").strong());
+        ui.label(
+            egui::RichText::new(
+                "Plan podcelów na starcie i ratunek, gdy Jev utknie — nigdy nie blokuje pętli. \
+                 Każda propozycja przechodzi te same bramki co decyzja Jev.",
+            )
+            .weak()
+            .small(),
+        );
+        match self.two_key {
+            Some(name) => {
+                ui.label(
+                    egui::RichText::new(format!("klucz: {name} ✓"))
+                        .weak()
+                        .small(),
+                );
+            }
+            None => {
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 200, 90),
+                    "brak klucza OpenRouter — ustaw OPENROUTER_API_KEY (zmienna użytkownika) i uruchom ponownie",
+                );
+            }
+        }
+        ui.add_enabled_ui(self.two_key.is_some(), |ui| {
+            ui.checkbox(&mut self.settings.two_enabled, "włącz System Two");
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Model:");
+            ui.label(
+                egui::RichText::new(&self.settings.two_model)
+                    .strong()
+                    .color(TWO_COLOR),
+            );
+            if let Some(p) = self.model_price(&self.settings.two_model) {
+                ui.label(egui::RichText::new(p).weak().small());
+            }
+            let fav = self
+                .settings
+                .two_favorites
+                .contains(&self.settings.two_model);
+            if ui
+                .small_button(if fav { "★" } else { "☆" })
+                .on_hover_text("ulubiony")
+                .clicked()
+            {
+                let id = self.settings.two_model.clone();
+                if fav {
+                    self.settings.two_favorites.retain(|f| f != &id);
+                } else {
+                    self.settings.two_favorites.push(id);
+                }
+            }
+        });
+        if !self.settings.two_favorites.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("ulubione:").weak().small());
+                let favs = self.settings.two_favorites.clone();
+                for f in favs {
+                    if ui
+                        .selectable_label(
+                            self.settings.two_model == f,
+                            egui::RichText::new(&f).small(),
+                        )
+                        .clicked()
+                    {
+                        self.settings.two_model = f;
+                    }
+                }
+            });
+        }
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.model_filter)
+                    .hint_text("szukaj: gemini, claude, gpt, :free …")
+                    .desired_width(300.0),
+            );
+            if ui
+                .button("↻")
+                .on_hover_text("pobierz listę modeli ponownie")
+                .clicked()
+            {
+                self.models = None;
+                self.models_err = None;
+                self.fetch_models();
+            }
+            if self.models_rx.is_some() {
+                ui.spinner();
+            }
+        });
+        if let Some(e) = &self.models_err {
+            ui.colored_label(
+                egui::Color32::from_rgb(255, 110, 110),
+                format!("lista modeli: {e}"),
+            );
+        }
+        let filter = self.model_filter.trim().to_ascii_lowercase();
+        let mut pick: Option<String> = None;
+        if let Some(models) = &self.models {
+            let matching: Vec<&ModelInfo> = models
+                .iter()
+                .filter(|m| {
+                    filter.is_empty()
+                        || m.id.to_ascii_lowercase().contains(&filter)
+                        || m.name.to_ascii_lowercase().contains(&filter)
+                })
+                .collect();
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} z {} modeli{}",
+                    matching.len().min(MODEL_LIST_MAX),
+                    models.len(),
+                    if matching.len() > MODEL_LIST_MAX {
+                        " (zawęź wyszukiwanie)"
+                    } else {
+                        ""
+                    }
+                ))
+                .weak()
+                .small(),
+            );
+            egui::ScrollArea::vertical()
+                .max_height(200.0)
+                .show(ui, |ui| {
+                    for m in matching.into_iter().take(MODEL_LIST_MAX) {
+                        let label = if m.is_free() {
+                            format!("{} · darmowy · {}k ctx", m.id, m.context_length / 1000)
+                        } else {
+                            format!(
+                                "{} · ${:.2} / ${:.2} za Mtok · {}k ctx",
+                                m.id,
+                                m.prompt_usd_per_mtok,
+                                m.completion_usd_per_mtok,
+                                m.context_length / 1000
+                            )
+                        };
+                        if ui
+                            .selectable_label(
+                                self.settings.two_model == m.id,
+                                egui::RichText::new(label).small(),
+                            )
+                            .clicked()
+                        {
+                            pick = Some(m.id.clone());
+                        }
+                    }
+                });
+        }
+        if let Some(id) = pick {
+            self.settings.two_model = id;
         }
     }
 }
@@ -653,7 +998,32 @@ fn step_card(ui: &mut egui::Ui, r: &StepRecord) {
                 .weak(),
             );
         });
+        if let Some(sg) = &r.subgoal {
+            ui.label(
+                egui::RichText::new(format!("podcel {sg}"))
+                    .color(TWO_COLOR)
+                    .small(),
+            );
+        }
         ui.colored_label(color, format!("→ {verdict}"));
+        if let Some(t) = &r.two {
+            ui.label(
+                egui::RichText::new(format!(
+                    "System Two ({}, {} , {:.1} s, ${:.4}){}: {}",
+                    match t.kind {
+                        uc_two::Kind::Plan => "plan",
+                        uc_two::Kind::Rescue => "ratunek",
+                    },
+                    t.model,
+                    t.ms / 1000.0,
+                    t.cost_usd,
+                    if t.applied { " ✓" } else { "" },
+                    t.note
+                ))
+                .color(TWO_COLOR)
+                .small(),
+            );
+        }
         ui.label(
             egui::RichText::new(format!(
                 "cel {:.2} · tekst {:.2} · destrukcyjne {:.2} · target {} {} ({:.2}, gap {:.2}) · op {} {:.2}",

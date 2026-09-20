@@ -3636,6 +3636,7 @@ dependencies = [
  "tokio",
  "uc-input",
  "uc-jev",
+ "uc-two",
  "uc-uia",
  "uc-voice",
  "uc-win32",
@@ -3647,6 +3648,18 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "uc-two"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "uc-jev",
 ]
 
 [[package]]
@@ -3694,12 +3707,14 @@ dependencies = [
  "anyhow",
  "clap",
  "eframe",
+ "serde",
  "serde_json",
  "tokio",
  "uc-input",
  "uc-jev",
  "uc-loop",
  "uc-shell",
+ "uc-two",
  "uc-uia",
  "uc-win32",
 ]
