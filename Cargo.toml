@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
-repository = "https://github.com/hexart/Jev-UltraCuse"
+repository = "https://github.com/lazniak/Jev-UltraCuse"
 
 [workspace.dependencies]
 # Pinned: `windows` 0.62 is the current stable line; 0.100 is a future breaking rewrite (ADR-001).
