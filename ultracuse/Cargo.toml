@@ -16,7 +16,9 @@ uc-input = { path = "../crates/uc-input" }
 uc-shell = { path = "../crates/uc-shell" }
 uc-jev = { path = "../crates/uc-jev" }
 uc-loop = { path = "../crates/uc-loop" }
+uc-two = { path = "../crates/uc-two" }
 anyhow = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }

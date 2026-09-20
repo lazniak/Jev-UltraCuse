@@ -10,6 +10,7 @@ uc-win32 = { path = "../uc-win32" }
 uc-uia = { path = "../uc-uia" }
 uc-input = { path = "../uc-input" }
 uc-jev = { path = "../uc-jev" }
+uc-two = { path = "../uc-two" }
 uc-voice = { path = "../uc-voice" }
 serde = { workspace = true }
 serde_json = { workspace = true }
