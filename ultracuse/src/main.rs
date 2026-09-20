@@ -513,9 +513,12 @@ struct RunArgs {
     #[arg(long, default_value = "runs")]
     ledger_dir: String,
     /// System Two: consult an OpenRouter chat model beside the loop (plan, rescue,
-    /// text). `--two` alone uses the default model; env `UC_TWO_MODEL` overrides it.
-    #[arg(long, value_name = "MODEL", num_args = 0..=1, default_missing_value = uc_loop::consts::TWO_DEFAULT_MODEL)]
-    two: Option<String>,
+    /// text). Model: --two-model, else env UC_TWO_MODEL, else the default.
+    #[arg(long)]
+    two: bool,
+    /// OpenRouter model id for System Two (implies --two).
+    #[arg(long, value_name = "MODEL")]
+    two_model: Option<String>,
 }
 
 fn run(a: RunArgs) -> Result<()> {
@@ -526,16 +529,16 @@ fn run(a: RunArgs) -> Result<()> {
         Some(other) => anyhow::bail!("unknown provider {other}"),
     };
     let dictated = a.text.clone().or_else(|| uc_loop::extract_quoted(&a.goal));
-    let two_model = a.two.as_ref().map(|m| {
-        if m == uc_loop::consts::TWO_DEFAULT_MODEL {
+    let two_model = if a.two || a.two_model.is_some() {
+        Some(a.two_model.clone().unwrap_or_else(|| {
             std::env::var("UC_TWO_MODEL")
                 .ok()
                 .filter(|v| !v.trim().is_empty())
-                .unwrap_or_else(|| m.clone())
-        } else {
-            m.clone()
-        }
-    });
+                .unwrap_or_else(|| uc_loop::consts::TWO_DEFAULT_MODEL.to_string())
+        }))
+    } else {
+        None
+    };
     let two = match &two_model {
         Some(model) => Some(
             uc_two::Config::discover(
