@@ -286,7 +286,8 @@ pub fn rect_union(a: Rect, b: Rect) -> Rect {
 
 /// Visible pop-ups of process `pid` other than `main`: context menus (`#32768`),
 /// drop-down lists, XAML flyouts, owned dialogs — every `WS_POPUP` or owned top-level
-/// window with a non-empty rectangle, tooltips excluded. Front-most first, at most
+/// window with a non-empty rectangle; tooltips and minimized windows excluded (an
+/// iconic window sits at −32000,−32000 and would blow the viewport up). Front-most first, at most
 /// `max_n`. These never become the foreground window, so a scan of the foreground
 /// alone would miss them. ~1 ms.
 pub fn popups_of(pid: u32, main: HWND, max_n: usize) -> Vec<(HWND, Rect)> {
@@ -303,7 +304,11 @@ pub fn popups_of(pid: u32, main: HWND, max_n: usize) -> Vec<(HWND, Rect)> {
         if ctx.out.len() >= ctx.max_n {
             return false.into();
         }
-        if hwnd == ctx.main || !IsWindowVisible(hwnd).as_bool() || window_pid(hwnd) != ctx.pid {
+        if hwnd == ctx.main
+            || !IsWindowVisible(hwnd).as_bool()
+            || IsIconic(hwnd).as_bool()
+            || window_pid(hwnd) != ctx.pid
+        {
             return true.into();
         }
         let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;

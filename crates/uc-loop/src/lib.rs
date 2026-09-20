@@ -672,6 +672,9 @@ pub fn perceive(
     let mut scan = scanner.scan_hwnd(scene.hwnd(), include_context);
     let mut viewport = scene.rect;
     let mut popups = 0usize;
+    // Pop-up elements go *first*: `reduce` dedupes on (role, name) keeping the first
+    // occurrence, and a menu's "Delete" must win over a same-named ribbon button.
+    let mut front: Vec<uc_uia::Element> = Vec::new();
     for (h, r) in uc_win32::popups_of(scene.pid, scene.hwnd(), consts::MAX_POPUPS) {
         let extra = scanner.scan_hwnd(h, include_context);
         if extra.elements.is_empty() {
@@ -681,7 +684,11 @@ pub fn perceive(
         scan.raw_count += extra.raw_count;
         scan.total_ms += extra.total_ms;
         viewport = uc_win32::rect_union(viewport, r);
-        scan.elements.extend(extra.elements);
+        front.extend(extra.elements);
+    }
+    if !front.is_empty() {
+        front.append(&mut scan.elements);
+        scan.elements = front;
     }
     let reduced = uc_uia::reduce(
         &scan.elements,
