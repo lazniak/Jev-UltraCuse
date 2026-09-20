@@ -207,6 +207,43 @@ pub struct Decision {
 }
 
 impl Decision {
+    /// A synthetic single-`choice` decision (tests of gates that read distributions).
+    pub fn from_probs(name: &str, probs: HashMap<String, f64>) -> Self {
+        let mut answers = HashMap::new();
+        let mut ranked: Vec<(&String, &f64)> = probs.iter().collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let choice = ranked
+            .first()
+            .map(|(k, _)| (*k).clone())
+            .unwrap_or_default();
+        let confidence = match (ranked.first(), ranked.get(1)) {
+            (Some((_, a)), Some((_, b))) => *a - *b,
+            (Some((_, a)), None) => **a,
+            _ => 0.0,
+        };
+        answers.insert(
+            name.to_string(),
+            Answer::Choice {
+                choice,
+                confidence,
+                probabilities: probs,
+            },
+        );
+        Self {
+            answers,
+            model: String::new(),
+            request_id: String::new(),
+            usage: Usage::default(),
+            cost_usd: 0.0,
+            timing: Timing {
+                http_ms: 0.0,
+                total_ms: 0.0,
+                hedged: false,
+                winner: 0,
+            },
+        }
+    }
+
     pub fn noul(&self, name: &str) -> Option<f64> {
         match self.answers.get(name)? {
             Answer::Noul { noul } => Some(*noul),
