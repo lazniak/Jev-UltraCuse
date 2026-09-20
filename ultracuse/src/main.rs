@@ -263,6 +263,7 @@ fn probe(delay: u64, as_json: bool, context: bool, max: usize, hwnd: Option<isiz
         elements: &reduced,
         last: None,
         dictated: None,
+        plan: None,
     };
     if as_json {
         println!(
@@ -511,6 +512,13 @@ struct RunArgs {
     /// Where the JSONL ledger goes (one file per run).
     #[arg(long, default_value = "runs")]
     ledger_dir: String,
+    /// System Two: consult an OpenRouter chat model beside the loop (plan, rescue,
+    /// text). Model: --two-model, else env UC_TWO_MODEL, else the default.
+    #[arg(long)]
+    two: bool,
+    /// OpenRouter model id for System Two (implies --two).
+    #[arg(long, value_name = "MODEL")]
+    two_model: Option<String>,
 }
 
 fn run(a: RunArgs) -> Result<()> {
@@ -521,6 +529,27 @@ fn run(a: RunArgs) -> Result<()> {
         Some(other) => anyhow::bail!("unknown provider {other}"),
     };
     let dictated = a.text.clone().or_else(|| uc_loop::extract_quoted(&a.goal));
+    let two_model = if a.two || a.two_model.is_some() {
+        Some(a.two_model.clone().unwrap_or_else(|| {
+            std::env::var("UC_TWO_MODEL")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| uc_loop::consts::TWO_DEFAULT_MODEL.to_string())
+        }))
+    } else {
+        None
+    };
+    let two = match &two_model {
+        Some(model) => Some(
+            uc_two::Config::discover(
+                model,
+                uc_loop::consts::TWO_MAX_CALLS,
+                std::time::Duration::from_millis(uc_loop::consts::TWO_TIMEOUT_MS),
+            )
+            .context("System Two")?,
+        ),
+        None => None,
+    };
     let opts = uc_loop::RunOpts {
         act: a.act,
         max_steps: a.max_steps,
@@ -533,6 +562,7 @@ fn run(a: RunArgs) -> Result<()> {
             .map(|h| uc_win32::window_pid(uc_win32::HWND(h as *mut core::ffi::c_void))),
         target_hwnd: a.hwnd,
         stop: None,
+        two,
     };
     let mut runner = uc_loop::Runner::new(opts).context("runner init")?;
     let warm = runner.warm().context("jev warm-up")?;
@@ -571,18 +601,29 @@ fn run(a: RunArgs) -> Result<()> {
         println!("{}", serde_json::to_string(&summary)?);
     } else {
         println!(
-            "outcome: {:?} | steps {} | {:.0} ms | jev calls {} | ${:.5}{}",
+            "outcome: {:?} | steps {} | {:.0} ms | jev calls {} | ${:.5}{}{}",
             summary.outcome,
             summary.steps,
             summary.elapsed_ms,
             summary.jev_calls,
             summary.cost_usd,
             summary
+                .two_model
+                .as_ref()
+                .map(|m| format!(
+                    " | system two {m}: {} calls ${:.4}",
+                    summary.two_calls, summary.two_cost_usd
+                ))
+                .unwrap_or_default(),
+            summary
                 .ledger
                 .as_ref()
                 .map(|p| format!(" | ledger {}", p.display()))
                 .unwrap_or_default()
         );
+        if let Some(plan) = &summary.plan {
+            println!("plan: {}", plan.join(" → "));
+        }
     }
     // 0 = goal reached / preview shown; 2 = stopped (uncertain, blocked, needs text,
     // budget, focus lost); 3 = the target window is gone (often the goal, not provable).
@@ -666,5 +707,25 @@ fn format_step(r: &uc_loop::StepRecord) -> String {
         s.needs_text,
         s.is_destructive,
         verdict
-    )
+    ) + &two_lines(r)
+}
+
+/// System Two's trace for a step: the sub-goal Jev was asked about and any consultation.
+fn two_lines(r: &uc_loop::StepRecord) -> String {
+    let mut out = String::new();
+    if let Some(sg) = &r.subgoal {
+        out.push_str(&format!("\n    subgoal {sg}"));
+    }
+    for t in &r.two {
+        out.push_str(&format!(
+            "\n    system two {:?} {} {:.0} ms ${:.4}{}: {}",
+            t.kind,
+            t.model,
+            t.ms,
+            t.cost_usd,
+            if t.applied { " (applied)" } else { "" },
+            t.note
+        ));
+    }
+    out
 }

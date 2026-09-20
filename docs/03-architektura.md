@@ -140,9 +140,9 @@ Bramka Tier 0 przed wykonaniem: komenda musi być ASCII bez polskich czasownikó
 - `session_id`/`trace` tylko dla OpenRouter.
 - Ledger (JSONL) przez kanał, zapis w tle: stage timings, tokeny, koszt (vendor: liczony z ceny), rozkłady, hash stanu, decyzja, wynik weryfikacji.
 
-## 9. System Two (rzadko)
+## 9. System Two (obok pętli, nigdy zamiast niej)
 
-Wywoływany tylko: `target=none` 2× ∨ Hn > 0.6 przez 2 kroki ∨ użytkownik prosi „napisz…". Dostaje `GuiState` + rozkład Jev jako prior, zwraca **jeden wiersz** planu (3–5 kroków) albo tekst. Model przez OpenRouter (mały: `google/gemini-2.5-flash-lite` lub `inception/mercury-2.5`), max 3 wywołania/zadanie. Bez Systemu Two aplikacja działa (dyktowanie + Jev).
+Decyzja i szczegóły: [05-ADR-system-two.md](05-ADR-system-two.md). Skrót: `crates/uc-two` (własny wątek, kanał, `Advisor`), trzy wejścia — plan na starcie (pętla **nie czeka**, `try_recv` przy kolejnych krokach; `goal` w stanie Jev = bieżący podcel), ratunek przy `Uncertain` (pętla czeka do `TWO_WAIT_MS`, bo i tak kończyłaby krok pusto), tekst przy `needs_text` bez dyktowania. Propozycje przez `policy::from_advice` — te same bramki co dla Jev, nieodwracalne tylko z `--allow-irreversible`. Model wybierany w oknie (lista `/models` OpenRouter, ulubione), klucz z env; max `TWO_MAX_CALLS` = 3 wywołania/przebieg. Bez klucza aplikacja działa jak dotąd (dyktowanie + Jev).
 
 ## 10. Bezpieczeństwo i prywatność
 
@@ -194,5 +194,6 @@ Pierwszy prototyp domyka pętlę z §3 na żywym oknie (`bench/R4-mvp-run.md`), 
 | executor | `SendInput` przez `uc-input` (click, type/paste, key, scroll); bez wzorców UIA | 1.2 |
 | tekst do wpisania | cudzysłów w celu albo `--text` | dyktowanie (2.x) |
 | percepcja | UIA bez `--context`; `document` (50030) w interaktywnych; wartość RichEdit niewidoczna | `TextPattern` (1.8), OCR (3.3) |
-| cache makr, System Two, głos, tray | brak | 1.5, 3.4, 2.x, 3.1 |
+| System Two | `uc-two` (2026-09-21): plan → podcele, ratunek przy `Uncertain`, tekst na żądanie; modal wyboru modelu; bramki `from_advice` | pomiar R5 (TASKS 3.7) |
+| cache makr, głos, tray | brak | 1.5, 2.x, 3.1 |
 | ledger | JSONL per przebieg w `runs/` (na gorącej ścieżce, `writeln!`) | poza gorącą ścieżką (1.3) |

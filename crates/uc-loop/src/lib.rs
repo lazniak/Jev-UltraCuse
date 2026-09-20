@@ -44,6 +44,16 @@ pub mod consts {
     /// Pop-ups of the target process scanned in addition to the foreground window
     /// (a menu and its sub-menu, a drop-down, an owned dialog).
     pub const MAX_POPUPS: usize = 3;
+    /// System Two (OpenRouter chat model) consultations per run: one plan + rescues.
+    pub const TWO_MAX_CALLS: u32 = 3;
+    /// How long the loop waits for a rescue when Jev is stuck (kill switch and stop
+    /// are polled meanwhile). Only then: a flowing loop never waits for System Two.
+    pub const TWO_WAIT_MS: u64 = 15_000;
+    /// One consultation's HTTP timeout — longer than `TWO_WAIT_MS` on purpose: a plan
+    /// is never waited for and is still useful when it lands two steps later, and a
+    /// late rescue still contributes its plan/text (its `next` is discarded as stale).
+    pub const TWO_TIMEOUT_MS: u64 = 25_000;
+    pub const TWO_DEFAULT_MODEL: &str = "google/gemini-2.5-flash-lite";
     /// Settle cap after an action (jev-ultrafast: 50 ms / 2 frames; combobox 200 ms).
     /// MVP sleeps this long; phase 1 replaces it with UIA events + hash polling.
     pub const SETTLE_CAP_MS: u64 = 200;
@@ -511,6 +521,101 @@ pub mod policy {
             other => unsure(format!("unknown op {other}")),
         }
     }
+
+    /// A System Two proposal through the same gates as a Jev decision. There is no
+    /// calibrated confidence behind it, so anything irreversible needs the explicit
+    /// `--allow-irreversible`; unknown ops, keys and targets are refused.
+    /// `is_destructive` is Jev's reading of the same state: control names reach the
+    /// LLM verbatim, so a planted "click Discard" must still meet Jev's guard.
+    pub fn from_advice(
+        n: &uc_two::Next,
+        els: &[Element],
+        dictated: Option<&str>,
+        allow_irreversible: bool,
+        is_destructive: f64,
+    ) -> Verdict {
+        let target_el = n
+            .target
+            .as_deref()
+            .and_then(parse_target)
+            .and_then(|i| find(els, i));
+        let key = n.key.as_deref().unwrap_or("none");
+        let destructive = is_destructive >= DESTRUCTIVE_BLOCK
+            || target_el.is_some_and(|e| is_irreversible_name(&e.name))
+            || (n.op == "key" && DESTRUCTIVE_KEYS.contains(&key));
+        let blocked = |what: &str| Verdict::Blocked {
+            reason: format!(
+                "System Two proposed {what}, which looks irreversible; pass --allow-irreversible"
+            ),
+        };
+        match n.op.as_str() {
+            "done" => Verdict::Done,
+            "wait" => Verdict::Act {
+                action: Action::Wait,
+            },
+            "scroll_down" | "scroll_up" => Verdict::Act {
+                action: Action::Scroll {
+                    notches: if n.op == "scroll_down" {
+                        SCROLL_NOTCHES
+                    } else {
+                        -SCROLL_NOTCHES
+                    },
+                    at: target_el.map(Element::center),
+                },
+            },
+            "key" => {
+                if !q::KEYS.iter().any(|(k, _)| *k == key) || key == "none" {
+                    return unsure(format!("System Two proposed unknown key {key}"));
+                }
+                if destructive && !allow_irreversible {
+                    return blocked(&format!("key {key}"));
+                }
+                Verdict::Act {
+                    action: Action::Key {
+                        key: key.to_string(),
+                    },
+                }
+            }
+            "type" => {
+                let Some(text) = n.text.as_deref().or(dictated) else {
+                    return Verdict::NeedsText;
+                };
+                if destructive && !allow_irreversible {
+                    return blocked("typing here");
+                }
+                let focus = target_el.filter(|e| e.enabled);
+                Verdict::Act {
+                    action: Action::Type {
+                        text: text.to_string(),
+                        focus: focus.map(Element::center),
+                        target_name: focus.map(describe),
+                    },
+                }
+            }
+            "click" | "right_click" => {
+                let Some(el) = target_el else {
+                    return unsure("System Two proposed a click without a listed target".into());
+                };
+                if !el.enabled {
+                    return unsure(format!("target {} is disabled", describe(el)));
+                }
+                if destructive && !allow_irreversible {
+                    return blocked(&format!("click {}", describe(el)));
+                }
+                let (x, y) = el.center();
+                Verdict::Act {
+                    action: Action::Click {
+                        target: el.i,
+                        name: describe(el),
+                        x,
+                        y,
+                        right: n.op == "right_click",
+                    },
+                }
+            }
+            other => unsure(format!("System Two proposed unknown op {other}")),
+        }
+    }
 }
 
 // ------------------------------------------------------------------ exec
@@ -648,6 +753,8 @@ pub enum LoopError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    #[error("System Two: {0}")]
+    Two(String),
 }
 
 /// One step's view of the target: the foreground window plus its pop-ups, reduced.
@@ -727,6 +834,9 @@ pub struct RunOpts {
     /// Cooperative stop from another thread (a Stop button); checked wherever the
     /// kill switch is.
     pub stop: Option<Arc<AtomicBool>>,
+    /// System Two: an OpenRouter chat model consulted beside the loop (plan at the
+    /// start, rescue when Jev is stuck, text on demand). `None` = Jev only.
+    pub two: Option<uc_two::Config>,
 }
 
 impl Default for RunOpts {
@@ -741,6 +851,7 @@ impl Default for RunOpts {
             target_pid: None,
             target_hwnd: None,
             stop: None,
+            two: None,
         }
     }
 }
@@ -756,6 +867,12 @@ pub struct StepRecord {
     /// Pop-up windows of the target process (menus, drop-downs, dialogs) merged into
     /// the scan.
     pub popups: usize,
+    /// The sub-goal Jev was asked about (`k/n: text`) when a System Two plan is active.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subgoal: Option<String>,
+    /// System Two consultations applied or received during this step.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub two: Vec<uc_two::Note>,
     pub sent_elements: usize,
     pub est_tokens: usize,
     pub tree_hash: u64,
@@ -810,6 +927,11 @@ pub struct RunSummary {
     pub jev_calls: u64,
     pub cost_usd: f64,
     pub ledger: Option<PathBuf>,
+    pub two_model: Option<String>,
+    pub two_calls: u32,
+    pub two_cost_usd: f64,
+    /// The plan System Two produced, if any was adopted.
+    pub plan: Option<Vec<String>>,
 }
 
 pub type StepHook = Box<dyn FnMut(&StepRecord)>;
@@ -822,6 +944,7 @@ pub struct Runner {
     client: uc_jev::Client,
     /// Called after every step, before the ledger write.
     pub on_step: Option<StepHook>,
+    two: Option<uc_two::Advisor>,
 }
 
 impl Runner {
@@ -835,12 +958,19 @@ impl Runner {
         cfg.hedge_after = Some(Duration::from_millis(consts::HEDGE_AFTER_MS));
         let client = uc_jev::Client::new(cfg)?;
         let rt = tokio::runtime::Runtime::new()?;
+        let two = match opts.two.clone() {
+            Some(cfg) => {
+                Some(uc_two::Advisor::spawn(cfg).map_err(|e| LoopError::Two(e.to_string()))?)
+            }
+            None => None,
+        };
         Ok(Self {
             opts,
             scanner,
             rt,
             client,
             on_step: None,
+            two,
         })
     }
 
@@ -849,10 +979,12 @@ impl Runner {
     }
 
     fn stop_requested(&self) -> bool {
-        self.opts
-            .stop
-            .as_ref()
-            .is_some_and(|f| f.load(Ordering::Relaxed))
+        stop_set(&self.opts.stop)
+    }
+
+    /// System Two's model id, when enabled.
+    pub fn two_model(&self) -> Option<&str> {
+        self.two.as_ref().map(|t| t.model())
     }
 
     /// Open the HTTP/2 connection with one tiny decision; returns its latency in ms.
@@ -866,7 +998,12 @@ impl Runner {
             Some(dir) => Some(open_ledger(dir, goal)?),
             None => None,
         };
-        let dictated = self.opts.dictated.clone();
+        let mut dictated = self.opts.dictated.clone();
+        let stop_flag = self.opts.stop.clone();
+        let allow_irreversible = self.opts.allow_irreversible;
+        // System Two's plan: `goal` becomes the current sub-goal until the last is done.
+        let mut plan: Option<Vec<String>> = None;
+        let mut plan_i = 0usize;
         let mut last: Option<Value> = None;
         let mut last_hash: Option<u64> = None;
         let mut uncertain = 0u32;
@@ -944,15 +1081,41 @@ impl Runner {
             }
 
             // 3. Decide: one request, six questions.
+            let goal_now: String = plan
+                .as_ref()
+                .map(|p| p[plan_i].clone())
+                .unwrap_or_else(|| goal.to_string());
+            let subgoal_label = plan
+                .as_ref()
+                .map(|p| format!("{}/{}: {}", plan_i + 1, p.len(), p[plan_i]));
             let state = uc_uia::GuiState {
-                goal,
+                goal: &goal_now,
                 scene: &scene,
                 elements: &reduced,
                 last: last.clone(),
                 dictated: dictated.as_deref(),
+                plan: plan
+                    .as_ref()
+                    .map(|p| json!({"overall": goal, "steps": p, "current": plan_i})),
             };
             let est_tokens = state.estimate_tokens();
             let state_bytes = serde_json::to_vec(&state)?;
+            // System Two, between the lines: the plan request goes out with the first
+            // state and is never waited for; the loop keeps deciding with Jev.
+            if steps == 1 {
+                if let Some(two) = self.two.as_mut() {
+                    two.ask(uc_two::Request {
+                        kind: uc_two::Kind::Plan,
+                        tag: steps as u64,
+                        goal: goal.to_string(),
+                        subgoal: None,
+                        state: serde_json::from_slice(&state_bytes)?,
+                        jev: None,
+                        why: None,
+                        need_text: dictated.is_none(),
+                    });
+                }
+            }
             let compiled = questions::compile(&reduced);
             let t_jev = Instant::now();
             let decision = self
@@ -1035,6 +1198,141 @@ impl Runner {
                 narrowed = true;
             }
 
+            // 4b. System Two, between the lines: fold in whatever arrived meanwhile (a
+            //     plan, text — a late rescue's `next` is stale and never executed);
+            //     when Jev is stuck, or needs text nobody dictated, ask for a rescue and
+            //     wait for *that* reply, since the step would otherwise end empty anyway.
+            let mut two_notes: Vec<uc_two::Note> = Vec::new();
+            let mut two_outcome: Option<Outcome> = None;
+            let mut two_decided = false;
+            if let Some(two) = self.two.as_mut() {
+                while let Some(reply) = two.try_recv() {
+                    two_notes.push(apply_reply(
+                        &reply,
+                        goal,
+                        &mut plan,
+                        &mut plan_i,
+                        &mut dictated,
+                        false,
+                    ));
+                }
+                let needs_text = matches!(verdict, policy::Verdict::NeedsText);
+                let stuck = matches!(verdict, policy::Verdict::Uncertain { .. })
+                    || (needs_text && dictated.is_none());
+                if stuck && two.remaining() > 0 {
+                    let why = match &verdict {
+                        policy::Verdict::Uncertain { reason, .. } => reason.clone(),
+                        _ => "the goal needs text and none was dictated".to_string(),
+                    };
+                    let tag = steps as u64;
+                    let asked = two.ask(uc_two::Request {
+                        kind: uc_two::Kind::Rescue,
+                        tag,
+                        goal: goal.to_string(),
+                        subgoal: plan.as_ref().map(|p| p[plan_i].clone()),
+                        state: serde_json::from_slice(&state_bytes)?,
+                        jev: Some(json!({
+                            "target_top": signals.target_top,
+                            "op": signals.op,
+                            "op_conf": signals.op_conf,
+                            "goal_reached": signals.goal_reached,
+                            "needs_text": signals.needs_text,
+                        })),
+                        why: Some(why),
+                        need_text: needs_text || signals.needs_text >= 0.5,
+                    });
+                    if asked {
+                        let t_wait = Instant::now();
+                        let deadline = t_wait + Duration::from_millis(consts::TWO_WAIT_MS);
+                        let mut reply = None;
+                        while Instant::now() < deadline {
+                            if uc_win32::kill_switch_pressed() {
+                                two_outcome = Some(Outcome::Killed);
+                                break;
+                            }
+                            if stop_set(&stop_flag) {
+                                two_outcome = Some(Outcome::Stopped);
+                                break;
+                            }
+                            match two.wait(Duration::from_millis(100)) {
+                                uc_two::Wait::Reply(r)
+                                    if r.kind == uc_two::Kind::Rescue && r.tag == tag =>
+                                {
+                                    reply = Some(r);
+                                    break;
+                                }
+                                // The worker is FIFO: a plan still in flight answers
+                                // first. Take it and keep waiting for ours.
+                                uc_two::Wait::Reply(r) => two_notes.push(apply_reply(
+                                    &r,
+                                    goal,
+                                    &mut plan,
+                                    &mut plan_i,
+                                    &mut dictated,
+                                    false,
+                                )),
+                                uc_two::Wait::Timeout => {}
+                                uc_two::Wait::Gone => break,
+                            }
+                        }
+                        match reply {
+                            Some(r) => {
+                                let mut note = apply_reply(
+                                    &r,
+                                    goal,
+                                    &mut plan,
+                                    &mut plan_i,
+                                    &mut dictated,
+                                    true,
+                                );
+                                let next_step = r.advice.as_ref().ok().and_then(|a| a.next.clone());
+                                if let Some(n) = next_step {
+                                    let v = policy::from_advice(
+                                        &n,
+                                        &reduced,
+                                        dictated.as_deref(),
+                                        allow_irreversible,
+                                        signals.is_destructive,
+                                    );
+                                    match &v {
+                                        policy::Verdict::Act { .. } | policy::Verdict::Done => {
+                                            note.applied = true;
+                                            two_decided = true;
+                                            verdict = v;
+                                        }
+                                        policy::Verdict::Blocked { reason }
+                                        | policy::Verdict::Uncertain { reason, .. } => {
+                                            note.note = format!("{} — {reason}", note.note);
+                                        }
+                                        policy::Verdict::NeedsText => {}
+                                    }
+                                } else if needs_text && dictated.is_some() {
+                                    // Text arrived: the original decision can now go ahead.
+                                    verdict = policy::judge(
+                                        &signals,
+                                        &reduced,
+                                        dictated.as_deref(),
+                                        allow_irreversible,
+                                    );
+                                    note.applied = matches!(verdict, policy::Verdict::Act { .. });
+                                    two_decided = note.applied;
+                                }
+                                two_notes.push(note);
+                            }
+                            None if two_outcome.is_none() => two_notes.push(uc_two::Note {
+                                kind: uc_two::Kind::Rescue,
+                                model: two.model().to_string(),
+                                ms: ms(t_wait),
+                                cost_usd: 0.0,
+                                note: "no reply within the wait budget".into(),
+                                applied: false,
+                            }),
+                            None => {}
+                        }
+                    }
+                }
+            }
+
             let mut rec = StepRecord {
                 step: steps,
                 ts_unix: ts_unix(),
@@ -1042,6 +1340,8 @@ impl Runner {
                 title: scene.title.clone(),
                 raw_elements: scan.raw_count,
                 popups,
+                subgoal: subgoal_label.clone(),
+                two: two_notes,
                 sent_elements: reduced.len(),
                 est_tokens,
                 tree_hash: hash,
@@ -1061,9 +1361,27 @@ impl Runner {
             };
 
             // 5. Act (or not).
-            let mut next: Option<Outcome> = None;
+            let mut next: Option<Outcome> = two_outcome;
             match &verdict {
-                policy::Verdict::Done => next = Some(Outcome::Done),
+                _ if next.is_some() => {}
+                policy::Verdict::Done => match &plan {
+                    Some(p) if plan_i + 1 < p.len() => {
+                        // Sub-goal done: on to the next one, counters fresh.
+                        last = Some(json!({
+                            "op": "subgoal_done",
+                            "subgoal": p[plan_i],
+                            "effect": "moving on to the next sub-goal",
+                        }));
+                        plan_i += 1;
+                        last_hash = None;
+                        last_was_wait = false;
+                        uncertain = 0;
+                        entropy_strikes = 0;
+                        stall = 0;
+                        waits = 0;
+                    }
+                    _ => next = Some(Outcome::Done),
+                },
                 policy::Verdict::NeedsText => next = Some(Outcome::NeedsText),
                 policy::Verdict::Blocked { reason } => {
                     next = Some(Outcome::Blocked(reason.clone()))
@@ -1087,7 +1405,8 @@ impl Runner {
                         .as_ref()
                         .unwrap_or(&rec.signals)
                         .target_entropy;
-                    if matches!(action, policy::Action::Click { .. }) {
+                    // Jev's entropy says nothing about a step System Two chose.
+                    if matches!(action, policy::Action::Click { .. }) && !two_decided {
                         if entropy > consts::ENTROPY_MAX {
                             entropy_strikes += 1;
                         } else {
@@ -1150,6 +1469,10 @@ impl Runner {
             jev_calls,
             cost_usd: cost,
             ledger: ledger.as_ref().map(|(_, p)| p.clone()),
+            two_model: self.two.as_ref().map(|t| t.model().to_string()),
+            two_calls: self.two.as_ref().map_or(0, |t| t.calls()),
+            two_cost_usd: self.two.as_ref().map_or(0.0, |t| t.cost_usd()),
+            plan,
         };
         if let Some((f, _)) = ledger.as_mut() {
             writeln!(f, "{}", serde_json::to_string(&summary)?)?;
@@ -1165,6 +1488,63 @@ fn focus_still_ours(locked_pid: Option<u32>, target_hwnd: Option<isize>) -> bool
         .is_none_or(|h| uc_win32::is_window(uc_win32::HWND(h as *mut core::ffi::c_void)));
     let fg_pid = uc_win32::foreground_hwnd().map(uc_win32::window_pid);
     alive && fg_pid.is_some() && fg_pid == locked_pid
+}
+
+fn stop_set(flag: &Option<Arc<AtomicBool>>) -> bool {
+    flag.as_ref().is_some_and(|f| f.load(Ordering::Relaxed))
+}
+
+/// Fold one System Two reply into the run: a plan is adopted once (never replaced),
+/// a rephrased sub-goal overrides the current one (only when `allow_subgoal`: a reply
+/// answering an older step must not rewrite the current one), text fills an empty
+/// dictation. A proposed step (`next`) is left to the caller, which has the elements
+/// to vet it. Without a plan, a sub-goal becomes step one *before* the overall goal,
+/// so finishing it can never end the run as "goal reached".
+fn apply_reply(
+    r: &uc_two::Reply,
+    goal: &str,
+    plan: &mut Option<Vec<String>>,
+    plan_i: &mut usize,
+    dictated: &mut Option<String>,
+    allow_subgoal: bool,
+) -> uc_two::Note {
+    let mut note = uc_two::Note {
+        kind: r.kind,
+        model: r.model.clone(),
+        ms: r.ms,
+        cost_usd: r.cost_usd,
+        note: String::new(),
+        applied: false,
+    };
+    match &r.advice {
+        Err(e) => note.note = format!("error: {e}"),
+        Ok(a) => {
+            note.note = a.note.clone().unwrap_or_default();
+            if let (Some(steps), None) = (&a.plan, &*plan) {
+                *plan = Some(steps.clone());
+                *plan_i = 0;
+                note.applied = true;
+                note.note = format!(
+                    "plan ({}): {} | {}",
+                    steps.len(),
+                    steps.join(" → "),
+                    note.note
+                );
+            }
+            if let (Some(sg), true) = (&a.subgoal, allow_subgoal) {
+                match plan.as_mut() {
+                    Some(p) => p[*plan_i] = sg.clone(),
+                    None => *plan = Some(vec![sg.clone(), goal.to_string()]),
+                }
+                note.applied = true;
+            }
+            if let (Some(t), None) = (&a.text, &*dictated) {
+                *dictated = Some(t.clone());
+                note.applied = true;
+            }
+        }
+    }
+    note
 }
 
 fn open_ledger(dir: &Path, goal: &str) -> Result<(std::fs::File, PathBuf), LoopError> {
@@ -1404,6 +1784,164 @@ mod tests {
         ));
         s.key_conf = 0.95;
         assert!(matches!(judge(&s, &els, None, true), Verdict::Act { .. }));
+    }
+
+    #[test]
+    fn advice_goes_through_the_gates() {
+        use uc_two::Next;
+        let els = [el(0, "button", "Save"), el(1, "button", "Delete")];
+        let next = |op: &str, target: Option<&str>| Next {
+            op: op.into(),
+            target: target.map(str::to_string),
+            key: None,
+            text: None,
+        };
+        let judge =
+            |n: &Next, allow: bool, destr: f64| policy::from_advice(n, &els, None, allow, destr);
+        assert!(matches!(
+            judge(&next("click", Some("e0")), false, 0.0),
+            Verdict::Act {
+                action: Action::Click { target: 0, .. }
+            }
+        ));
+        // Jev's own destructive reading gates the LLM's click on a harmless-looking name
+        assert!(matches!(
+            judge(&next("click", Some("e0")), false, 0.9),
+            Verdict::Blocked { .. }
+        ));
+        assert!(matches!(
+            judge(&next("click", Some("e1")), false, 0.0),
+            Verdict::Blocked { .. }
+        ));
+        assert!(matches!(
+            judge(&next("click", Some("e1")), true, 0.0),
+            Verdict::Act { .. }
+        ));
+        assert!(matches!(
+            judge(&next("click", Some("e7")), false, 0.0),
+            Verdict::Uncertain { .. }
+        ));
+        assert!(matches!(
+            judge(&next("type", None), false, 0.0),
+            Verdict::NeedsText
+        ));
+        let mut typed = next("type", Some("e0"));
+        typed.text = Some("hi".into());
+        assert!(matches!(
+            judge(&typed, false, 0.0),
+            Verdict::Act {
+                action: Action::Type { .. }
+            }
+        ));
+        let mut del = next("key", None);
+        del.key = Some("delete".into());
+        assert!(matches!(judge(&del, false, 0.0), Verdict::Blocked { .. }));
+        let mut odd = next("key", None);
+        odd.key = Some("ctrl+alt+del".into());
+        assert!(matches!(judge(&odd, true, 0.0), Verdict::Uncertain { .. }));
+        assert!(matches!(
+            judge(&next("done", None), false, 0.0),
+            Verdict::Done
+        ));
+    }
+
+    #[test]
+    fn replies_fold_into_plan_text_and_subgoal() {
+        let reply = |advice: uc_two::Advice| uc_two::Reply {
+            kind: uc_two::Kind::Plan,
+            tag: 1,
+            advice: Ok(advice),
+            model: "m".into(),
+            ms: 1.0,
+            cost_usd: 0.0,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+        };
+        let mut plan = None;
+        let mut i = 0usize;
+        let mut dictated = None;
+        let n = apply_reply(
+            &reply(uc_two::Advice {
+                plan: Some(vec!["a".into(), "b".into()]),
+                text: Some("t".into()),
+                ..Default::default()
+            }),
+            "overall",
+            &mut plan,
+            &mut i,
+            &mut dictated,
+            true,
+        );
+        assert!(n.applied);
+        assert_eq!(
+            plan.as_deref(),
+            Some(&["a".to_string(), "b".to_string()][..])
+        );
+        assert_eq!(dictated.as_deref(), Some("t"));
+        // a second plan never replaces the first; a sub-goal rewrites the current one
+        i = 1;
+        let n = apply_reply(
+            &reply(uc_two::Advice {
+                plan: Some(vec!["x".into()]),
+                subgoal: Some("b2".into()),
+                text: Some("ignored".into()),
+                ..Default::default()
+            }),
+            "overall",
+            &mut plan,
+            &mut i,
+            &mut dictated,
+            true,
+        );
+        assert!(n.applied);
+        assert_eq!(plan.as_ref().unwrap()[1], "b2");
+        assert_eq!(dictated.as_deref(), Some("t"));
+        // a late reply may not rewrite the current sub-goal
+        let n = apply_reply(
+            &reply(uc_two::Advice {
+                subgoal: Some("late".into()),
+                ..Default::default()
+            }),
+            "overall",
+            &mut plan,
+            &mut i,
+            &mut dictated,
+            false,
+        );
+        assert!(!n.applied);
+        assert_eq!(plan.as_ref().unwrap()[1], "b2");
+        let n = apply_reply(
+            &uc_two::Reply {
+                advice: Err("boom".into()),
+                ..reply(uc_two::Advice::default())
+            },
+            "overall",
+            &mut plan,
+            &mut i,
+            &mut dictated,
+            true,
+        );
+        assert!(!n.applied);
+        assert!(n.note.starts_with("error"));
+        // without a plan, a sub-goal is step one and the overall goal stays last
+        let mut plan2 = None;
+        let mut i2 = 0usize;
+        let mut d2 = None;
+        apply_reply(
+            &reply(uc_two::Advice {
+                subgoal: Some("open the menu".into()),
+                ..Default::default()
+            }),
+            "overall",
+            &mut plan2,
+            &mut i2,
+            &mut d2,
+            true,
+        );
+        assert_eq!(
+            plan2.as_deref(),
+            Some(&["open the menu".to_string(), "overall".to_string()][..])
+        );
     }
 
     #[test]

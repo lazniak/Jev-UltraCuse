@@ -479,6 +479,10 @@ pub struct GuiState<'a> {
     pub last: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dictated: Option<&'a str>,
+    /// System Two's plan: `{"overall": goal, "steps": [...], "current": i}` — `goal`
+    /// is then the current sub-goal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan: Option<serde_json::Value>,
 }
 
 impl GuiState<'_> {
