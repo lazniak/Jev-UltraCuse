@@ -575,11 +575,12 @@ fn run(a: RunArgs) -> Result<()> {
                 .unwrap_or_default()
         );
     }
-    if !matches!(
-        summary.outcome,
-        uc_loop::Outcome::Done | uc_loop::Outcome::Preview
-    ) {
-        std::process::exit(2);
+    // 0 = goal reached / preview shown; 2 = stopped (uncertain, blocked, needs text,
+    // budget, focus lost); 3 = the target window is gone (often the goal, not provable).
+    match summary.outcome {
+        uc_loop::Outcome::Done | uc_loop::Outcome::Preview => {}
+        uc_loop::Outcome::TargetGone => std::process::exit(3),
+        _ => std::process::exit(2),
     }
     Ok(())
 }

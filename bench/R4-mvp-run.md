@@ -15,9 +15,10 @@ Krok po kroku:
 ## Co się okazało (i co z tym zrobiono w tym samym PR)
 
 1. **Bez `document` (50030) w stanie** Notatnik nie ma pola, do którego można pisać — `target none`, model zgaduje „focused control”. Dodane do `INTERACTIVE_IDS` (`uc-uia`).
-2. **Blokada na proces okna docelowego jest obowiązkowa.** W pierwszym przebiegu (przed blokadą) fokus przeszedł do Chrome i pętla wpisała tekst 4× w obce okno (YouTube). Teraz: inny pid na wierzchu → `FocusLost` bez akcji; okno docelowe znika → `TargetGone`.
+2. **Blokada na proces okna docelowego jest obowiązkowa.** W pierwszym przebiegu (przed blokadą) fokus przeszedł do Chrome i pętla wpisała tekst 4× w obce okno (YouTube). Teraz: inny pid na wierzchu → `FocusLost` bez akcji; okno docelowe znika → `TargetGone`. Po przeglądzie PR #1: fokus i `IsWindow` sprawdzane **ponownie tuż przed wstrzyknięciem**, bo między skanem a akcją mija 0.3–2 s (skan + 1–2 wywołania Jev).
 3. **Pojedynczy noul o cel jest słaby** (0.34 tuż po udanym wpisaniu). Dwa sformułowania w tym samym wywołaniu, uśrednione (`goal_reached`, `1 − goal_pending`) → 0.85.
 4. **Dwie poprawne drogi rozdzierają `choice` na stałe.** „Zamknij” (przycisk) vs „Plik” (menu): 0.44–0.80 vs 0.18–0.39 zależnie od przebiegu; zawężony wybór 2-way = rzut monetą (0.53/0.47, H ≈ 1.0); **niezależne bramki noul per finalista** („czy e1 to poprawny krok?”) rozstrzygają: Plik 0.86. Reguła 2 z docs Jev („dekomponuj na atomowe sygnały") w praktyce.
 5. **`confidence` dla `choice` ≈ margines top-2**, nie p(top): przy {0.59, 0.41} API zwraca 0.18. Progi na `confidence` i na `gap` to prawie to samo — kalibracja (R6) ma to uwzględnić.
 6. **Wartość dokumentu (RichEdit) nie jest widoczna** przez `ValuePattern` — model widzi tylko tytuł karty `hello ultr. Zmodyfikowany.`. Odczyt `TextPattern` → TASKS 1.8.
-7. **Koszt kroku dziś**: scan 63–203 ms (Notatnik), Jev 265–318 ms na wywołanie, settle = stały sleep 200 ms → ~0.5–0.6 s/krok. Settle po zdarzeniach UIA (1.1) i cache makr (1.5) to następne −200…−300 ms.
+7. **Próg `done`**: to samo zadanie („Wpisz…”) dało `goal_reached` 0.85 i 0.84 (0.83/0.12 i 0.81/0.13) w dwóch przebiegach — przy progu 0.85 drugi skończył się `Uncertain` po 3 krokach zamiast `Done` po 2. Fałszywe „done” kosztuje powtórkę, nie dane, więc `DONE_THRESHOLD` = 0.75; 0.85 zostaje progiem dla nieodwracalnych.
+8. **Koszt kroku dziś**: scan 63–203 ms (Notatnik), Jev 265–318 ms na wywołanie, settle = stały sleep 200 ms → ~0.5–0.6 s/krok. Settle po zdarzeniach UIA (1.1) i cache makr (1.5) to następne −200…−300 ms.

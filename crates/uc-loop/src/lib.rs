@@ -21,8 +21,10 @@ pub mod consts {
     pub const CONF_SYSTEM_KEY: f64 = 0.75;
     /// Irreversible actions: threshold AND a spoken confirmation, always.
     pub const CONF_IRREVERSIBLE: f64 = 0.85;
-    /// `goal_reached` must clear this AND `op` must say `done` before the loop stops.
-    pub const DONE_THRESHOLD: f64 = 0.85;
+    /// `goal_reached` must clear this AND `op` must say `done` (at `CONF_FLOOR`) before
+    /// the loop stops. Lower than the irreversible bar on purpose: a false `done` costs a
+    /// re-run, and the same task measured 0.85 / 0.84 on two runs (`bench/R4-mvp-run.md`).
+    pub const DONE_THRESHOLD: f64 = 0.75;
     /// Narrow (region → element) instead of accepting when the top-2 gap is below this.
     pub const TOP2_GAP_MIN: f64 = 0.15;
     /// Escalate after this many consecutive steps with normalised entropy above 0.6.
@@ -44,6 +46,8 @@ pub mod consts {
     pub const FOCUS_SETTLE_MS: u64 = 40;
     /// Length of a `wait` step.
     pub const WAIT_MS: u64 = 300;
+    /// Consecutive `wait` steps before the run stops (waits never count as stalls).
+    pub const WAIT_STRIKES: u32 = 3;
     pub const SCROLL_NOTCHES: i32 = 3;
     /// Hedge an in-flight decision after this delay. A hedge can only win when the
     /// first request stalls past `delay + floor` (floor ≈ 267 ms from PL); with a
@@ -322,28 +326,6 @@ pub mod policy {
         }
     }
 
-    /// Two controls with the same role and name (window „Close” vs tab „Close”) split
-    /// the probability mass although either is what the user named; merge the runner-up
-    /// into the winner when it is such a duplicate. Returns `(confidence, top-2 gap)`.
-    /// Disambiguating by geometry in the criteria is TASKS 1.2.
-    pub fn merged_target(s: &Signals, els: &[Element]) -> (f64, f64) {
-        let Some(el) = parse_target(&s.target).and_then(|i| find(els, i)) else {
-            return (s.target_conf, s.target_gap);
-        };
-        let Some((id2, p2)) = s.target_top.get(1) else {
-            return (s.target_conf, s.target_gap);
-        };
-        let same = parse_target(id2)
-            .and_then(|i| find(els, i))
-            .is_some_and(|e2| e2.role == el.role && e2.name == el.name);
-        if !same {
-            return (s.target_conf, s.target_gap);
-        }
-        let conf = (s.target_conf + p2).min(1.0);
-        let p3 = s.target_top.get(2).map(|t| t.1).unwrap_or(0.0);
-        (conf, conf - p3)
-    }
-
     fn unsure(reason: String) -> Verdict {
         Verdict::Uncertain {
             reason,
@@ -373,6 +355,12 @@ pub mod policy {
     ) -> Verdict {
         let goal_done = s.goal_reached >= DONE_THRESHOLD;
         if goal_done && s.op == "done" {
+            if s.op_conf < CONF_FLOOR {
+                return unsure(format!(
+                    "done at op confidence {:.2} < {CONF_FLOOR}",
+                    s.op_conf
+                ));
+            }
             return Verdict::Done;
         }
         if goal_done || s.op == "done" {
@@ -385,9 +373,10 @@ pub mod policy {
             return unsure(format!("op {} at {:.2} < {CONF_FLOOR}", s.op, s.op_conf));
         }
         let target_el = parse_target(&s.target).and_then(|i| find(els, i));
-        let (target_conf, target_gap) = merged_target(s, els);
-        let target_ok =
-            target_el.is_some() && target_conf >= CONF_FLOOR && target_gap >= TOP2_GAP_MIN;
+        let (target_conf, target_gap) = (s.target_conf, s.target_gap);
+        let target_ok = target_el.is_some_and(|e| e.enabled)
+            && target_conf >= CONF_FLOOR
+            && target_gap >= TOP2_GAP_MIN;
         let unsure_target = |reason: String| Verdict::Uncertain {
             reason,
             narrow: shortlist(s),
@@ -440,8 +429,16 @@ pub mod policy {
                 let Some(text) = dictated else {
                     return Verdict::NeedsText;
                 };
-                if destructive && !allow_irreversible {
-                    return blocked("typing here");
+                if destructive {
+                    if !allow_irreversible {
+                        return blocked("typing here");
+                    }
+                    if s.op_conf < CONF_IRREVERSIBLE {
+                        return unsure(format!(
+                            "irreversible typing at op confidence {:.2} < {CONF_IRREVERSIBLE}",
+                            s.op_conf
+                        ));
+                    }
                 }
                 Verdict::Act {
                     action: Action::Type {
@@ -463,6 +460,9 @@ pub mod policy {
                 let Some(el) = target_el else {
                     return unsure("click without a listed target".into());
                 };
+                if !el.enabled {
+                    return unsure(format!("target {} is disabled", describe(el)));
+                }
                 if !target_ok {
                     return unsure_target(format!(
                         "target {} at {:.2}, gap {:.2}",
@@ -545,14 +545,24 @@ pub fn extract_quoted(goal: &str) -> Option<String> {
     const PAIRS: [(char, char); 5] = [('„', '”'), ('„', '"'), ('"', '"'), ('\'', '\''), ('«', '»')];
     let mut best: Option<(usize, String)> = None;
     for (open, close) in PAIRS {
-        let Some(start) = goal.find(open) else {
+        // An apostrophe is a quote only at a word boundary: "Don't save" has none.
+        let strict = open == '\'';
+        let Some(start) = goal
+            .match_indices(open)
+            .map(|(i, _)| i)
+            .find(|&i| !strict || at_word_start(goal, i))
+        else {
             continue;
         };
         let inner_start = start + open.len_utf8();
-        let Some(len) = goal[inner_start..].find(close) else {
+        let Some(end) = goal[inner_start..]
+            .match_indices(close)
+            .map(|(i, _)| inner_start + i)
+            .find(|&i| !strict || at_word_end(goal, i + close.len_utf8()))
+        else {
             continue;
         };
-        let text = goal[inner_start..inner_start + len].trim();
+        let text = goal[inner_start..end].trim();
         if text.is_empty() {
             continue;
         }
@@ -561,6 +571,19 @@ pub fn extract_quoted(goal: &str) -> Option<String> {
         }
     }
     best.map(|(_, t)| t)
+}
+
+/// A quote character opens a quotation only after start-of-text or a non-letter…
+fn at_word_start(s: &str, i: usize) -> bool {
+    s[..i]
+        .chars()
+        .next_back()
+        .is_none_or(|c| !c.is_alphanumeric())
+}
+
+/// …and closes one only before end-of-text or a non-letter.
+fn at_word_end(s: &str, i: usize) -> bool {
+    s[i..].chars().next().is_none_or(|c| !c.is_alphanumeric())
 }
 
 fn slug(goal: &str) -> String {
@@ -758,6 +781,8 @@ impl Runner {
         let mut uncertain = 0u32;
         let mut entropy_strikes = 0u32;
         let mut stall = 0u32;
+        let mut waits = 0u32;
+        let mut last_was_wait = false;
         let mut steps = 0usize;
         let mut jev_calls = 0u64;
         let mut cost = 0.0f64;
@@ -810,7 +835,9 @@ impl Runner {
             let changed = last_hash.map(|h| h != hash);
             match changed {
                 Some(false) => {
-                    stall += 1;
+                    if !last_was_wait {
+                        stall += 1;
+                    }
                     if let Some(l) = last.as_mut() {
                         l["effect"] = json!("no visible change");
                     }
@@ -963,8 +990,15 @@ impl Runner {
                 }
                 policy::Verdict::Act { action } => {
                     uncertain = 0;
+                    // The narrowed round reports the gates' entropy (0); the guard must
+                    // look at the first, full distribution.
+                    let entropy = rec
+                        .signals_first
+                        .as_ref()
+                        .unwrap_or(&rec.signals)
+                        .target_entropy;
                     if matches!(action, policy::Action::Click { .. }) {
-                        if rec.signals.target_entropy > consts::ENTROPY_MAX {
+                        if entropy > consts::ENTROPY_MAX {
                             entropy_strikes += 1;
                         } else {
                             entropy_strikes = 0;
@@ -972,13 +1006,18 @@ impl Runner {
                     }
                     if entropy_strikes >= consts::ENTROPY_STRIKES {
                         next = Some(Outcome::Uncertain(format!(
-                            "target entropy {:.2} for {} steps",
-                            rec.signals.target_entropy, entropy_strikes
+                            "target entropy {entropy:.2} for {entropy_strikes} steps"
                         )));
                     } else if !self.opts.act {
                         next = Some(Outcome::Preview);
                     } else if uc_win32::kill_switch_pressed() {
                         next = Some(Outcome::Killed);
+                    } else if !focus_still_ours(locked_pid, target_hwnd) {
+                        // Deciding took 0.3–2 s; a toast, a UAC prompt or an Alt-Tab may
+                        // have moved the foreground meanwhile. Never inject blind.
+                        next = Some(Outcome::FocusLost(
+                            "foreground changed while deciding".into(),
+                        ));
                     } else {
                         let t_act = Instant::now();
                         exec::perform(action)?;
@@ -986,6 +1025,15 @@ impl Runner {
                         rec.executed = true;
                         last = Some(action_summary(action));
                         last_hash = Some(hash);
+                        last_was_wait = matches!(action, policy::Action::Wait);
+                        if last_was_wait {
+                            waits += 1;
+                            if waits >= consts::WAIT_STRIKES {
+                                next = Some(Outcome::Stalled);
+                            }
+                        } else {
+                            waits = 0;
+                        }
                         std::thread::sleep(Duration::from_millis(consts::SETTLE_CAP_MS));
                     }
                 }
@@ -1016,6 +1064,15 @@ impl Runner {
         }
         Ok(summary)
     }
+}
+
+/// Is the locked process still in front and the target window still alive? Checked
+/// at the scan and again right before injecting.
+fn focus_still_ours(locked_pid: Option<u32>, target_hwnd: Option<isize>) -> bool {
+    let alive = target_hwnd
+        .is_none_or(|h| uc_win32::is_window(uc_win32::HWND(h as *mut core::ffi::c_void)));
+    let fg_pid = uc_win32::foreground_hwnd().map(uc_win32::window_pid);
+    alive && fg_pid.is_some() && fg_pid == locked_pid
 }
 
 fn open_ledger(dir: &Path, goal: &str) -> Result<(std::fs::File, PathBuf), LoopError> {
@@ -1089,6 +1146,50 @@ mod tests {
             judge(&s, &els, None, false),
             Verdict::Uncertain { .. }
         ));
+        let mut s = sig("done", "none", 0.9, 0.9);
+        s.goal_reached = 0.95;
+        s.op_conf = 0.35;
+        assert!(matches!(
+            judge(&s, &els, None, false),
+            Verdict::Uncertain { .. }
+        ));
+    }
+
+    #[test]
+    fn disabled_target_is_never_acted_on() {
+        let mut els = [el(0, "button", "Zapisz")];
+        els[0].enabled = false;
+        assert!(matches!(
+            judge(&sig("click", "e0", 0.95, 0.9), &els, None, false),
+            Verdict::Uncertain { .. }
+        ));
+        match judge(&sig("type", "e0", 0.95, 0.9), &els, Some("x"), false) {
+            Verdict::Act {
+                action: Action::Type { focus, .. },
+            } => assert_eq!(focus, None),
+            other => panic!("expected type without focus, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn destructive_typing_needs_the_irreversible_bar() {
+        let els = [el(0, "edit", "Name")];
+        let mut s = sig("type", "e0", 0.9, 0.9);
+        s.is_destructive = 0.7;
+        assert!(matches!(
+            judge(&s, &els, Some("x"), false),
+            Verdict::Blocked { .. }
+        ));
+        s.op_conf = 0.7;
+        assert!(matches!(
+            judge(&s, &els, Some("x"), true),
+            Verdict::Uncertain { .. }
+        ));
+        s.op_conf = 0.9;
+        assert!(matches!(
+            judge(&s, &els, Some("x"), true),
+            Verdict::Act { .. }
+        ));
     }
 
     #[test]
@@ -1134,37 +1235,6 @@ mod tests {
         assert!(matches!(
             judge(&s, &els, None, false),
             Verdict::Blocked { .. }
-        ));
-    }
-
-    #[test]
-    fn duplicate_names_merge_their_mass() {
-        let els = [
-            el(0, "button", "Zamknij"),
-            el(1, "button", "Zamknij"),
-            el(2, "button", "OK"),
-        ];
-        let mut s = sig("click", "e0", 0.50, 0.10);
-        s.target_top = vec![
-            ("e0".into(), 0.50),
-            ("e1".into(), 0.40),
-            ("e2".into(), 0.10),
-        ];
-        match judge(&s, &els, None, false) {
-            Verdict::Act {
-                action: Action::Click { target, .. },
-            } => assert_eq!(target, 0),
-            other => panic!("expected merged click, got {other:?}"),
-        }
-        // A different runner-up does not merge.
-        s.target_top = vec![
-            ("e0".into(), 0.50),
-            ("e2".into(), 0.40),
-            ("e1".into(), 0.10),
-        ];
-        assert!(matches!(
-            judge(&s, &els, None, false),
-            Verdict::Uncertain { .. }
         ));
     }
 
@@ -1262,6 +1332,8 @@ mod tests {
         assert_eq!(extract_quoted("type 'x y' now"), Some("x y".into()));
         assert_eq!(extract_quoted("no quotes here"), None);
         assert_eq!(extract_quoted("empty \"\" quotes"), None);
+        assert_eq!(extract_quoted("Don't save and don't close"), None);
+        assert_eq!(extract_quoted("it's 'ok' now"), Some("ok".into()));
     }
 
     #[test]

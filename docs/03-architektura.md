@@ -190,7 +190,7 @@ Pierwszy prototyp domyka pętlę z §3 na żywym oknie (`bench/R4-mvp-run.md`), 
 | settle po akcji | stały sleep `SETTLE_CAP_MS` = 200 ms, potem porównanie hasha drzewa w kodzie | zdarzenia UIA + hash (1.1) |
 | pytania kroku | 7 w jednym wywołaniu: `target`, `op`, `key`, `goal_reached` + `goal_pending` (uśrednione), `needs_text`, `is_destructive`; brak `progress`/`recovery` | 1.4 → 1.5 |
 | bliskie rozstrzygnięcie `target` | druga runda w tym samym kroku: **bramki noul per finalista** (nie `choice` 2-way — ten zostaje 50/50, gdy obie drogi są poprawne) | kalibracja R6 |
-| bramka w kodzie | progi z `consts`, zgodność `goal_reached` ∧ `op=done`, lista nieodwracalnych + `is_destructive ≥ 0.5` → `--allow-irreversible` i ≥ 0.85, blokada na pid okna, `IsWindow` | 1.6 (IsPassword), 2.4 (potwierdzenie głosem) |
+| bramka w kodzie | progi z `consts`, zgodność `goal_reached` ∧ `op=done`, lista nieodwracalnych + `is_destructive ≥ 0.5` → `--allow-irreversible` i ≥ 0.85 (click, key i type), kontrolki `disabled` odrzucane, blokada na pid okna + `IsWindow` sprawdzane przy skanie i tuż przed `SendInput` | 1.6 (IsPassword), 2.4 (potwierdzenie głosem) |
 | executor | `SendInput` przez `uc-input` (click, type/paste, key, scroll); bez wzorców UIA | 1.2 |
 | tekst do wpisania | cudzysłów w celu albo `--text` | dyktowanie (2.x) |
 | percepcja | UIA bez `--context`; `document` (50030) w interaktywnych; wartość RichEdit niewidoczna | `TextPattern` (1.8), OCR (3.3) |
