@@ -743,9 +743,7 @@ impl App {
                 );
             }
         }
-        ui.add_enabled_ui(self.two_key.is_some(), |ui| {
-            ui.checkbox(&mut self.settings.two_enabled, "włącz System Two");
-        });
+        ui.checkbox(&mut self.settings.two_enabled, "włącz System Two");
         ui.horizontal_wrapped(|ui| {
             ui.label("Model:");
             ui.label(
@@ -1006,10 +1004,10 @@ fn step_card(ui: &mut egui::Ui, r: &StepRecord) {
             );
         }
         ui.colored_label(color, format!("→ {verdict}"));
-        if let Some(t) = &r.two {
+        for t in &r.two {
             ui.label(
                 egui::RichText::new(format!(
-                    "System Two ({}, {} , {:.1} s, ${:.4}){}: {}",
+                    "System Two ({}, {}, {:.1} s, ${:.4}){}: {}",
                     match t.kind {
                         uc_two::Kind::Plan => "plan",
                         uc_two::Kind::Rescue => "ratunek",

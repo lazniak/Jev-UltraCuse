@@ -35,7 +35,7 @@ pub enum TwoError {
     Io(#[from] std::io::Error),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Config {
     pub model: String,
     key: String,
@@ -43,6 +43,21 @@ pub struct Config {
     pub key_name: &'static str,
     pub max_calls: u32,
     pub timeout: Duration,
+}
+
+/// Never the key itself — only which variable it came from and its length.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("model", &self.model)
+            .field(
+                "key",
+                &format_args!("<{} chars from {}>", self.key.len(), self.key_name),
+            )
+            .field("max_calls", &self.max_calls)
+            .field("timeout", &self.timeout)
+            .finish()
+    }
 }
 
 impl Config {
@@ -237,6 +252,9 @@ pub enum Kind {
 #[derive(Clone, Debug)]
 pub struct Request {
     pub kind: Kind,
+    /// Caller's tag (the loop's step number): a reply is matched to the step that
+    /// asked; a `next` from an older state is never executed.
+    pub tag: u64,
     pub goal: String,
     pub subgoal: Option<String>,
     /// The same reduced GUI state Jev saw (scene + elements with `e<i>` ids).
@@ -250,6 +268,7 @@ pub struct Request {
 #[derive(Clone, Debug)]
 pub struct Reply {
     pub kind: Kind,
+    pub tag: u64,
     pub advice: Result<Advice, String>,
     pub model: String,
     pub ms: f64,
@@ -374,6 +393,7 @@ async fn consult(client: &reqwest::Client, cfg: &Config, r: &Request) -> Reply {
     match res {
         Ok((content, cost_usd, p, c)) => Reply {
             kind: r.kind,
+            tag: r.tag,
             advice: parse_advice(&content),
             model: cfg.model.clone(),
             ms,
@@ -383,6 +403,7 @@ async fn consult(client: &reqwest::Client, cfg: &Config, r: &Request) -> Reply {
         },
         Err(e) => Reply {
             kind: r.kind,
+            tag: r.tag,
             advice: Err(e.to_string()),
             model: cfg.model.clone(),
             ms,
@@ -479,15 +500,25 @@ impl Advisor {
 
     /// Wait up to `d` for a reply — only worth it when the loop has nothing better
     /// to do (Jev already gave up on the step).
-    pub fn recv_timeout(&mut self, d: Duration) -> Option<Reply> {
+    pub fn wait(&mut self, d: Duration) -> Wait {
         match self.rx.recv_timeout(d) {
             Ok(r) => {
                 self.book(&r);
-                Some(r)
+                Wait::Reply(Box::new(r))
             }
-            Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => None,
+            Err(RecvTimeoutError::Timeout) => Wait::Timeout,
+            Err(RecvTimeoutError::Disconnected) => Wait::Gone,
         }
     }
+}
+
+/// Outcome of one bounded wait on the advisor.
+#[derive(Debug)]
+pub enum Wait {
+    Reply(Box<Reply>),
+    Timeout,
+    /// The advisor thread is gone (it never is, unless it panicked): stop waiting.
+    Gone,
 }
 
 #[cfg(test)]
@@ -563,6 +594,7 @@ mod tests {
     fn request_body_shape() {
         let r = Request {
             kind: Kind::Rescue,
+            tag: 7,
             goal: "g".into(),
             subgoal: Some("s".into()),
             state: json!({"elements": []}),
