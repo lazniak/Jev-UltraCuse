@@ -31,7 +31,7 @@ target\release\ultracuse.exe ps "Get-ChildItem $env:USERPROFILE\Desktop | Select
 
 ## Szybki start (MVP-1)
 
-**Okno** — `ultracuse.exe` bez argumentów (dwuklik) otwiera okno: wybór okna docelowego (lista albo „śledź ostatnio aktywne”: klikasz w docelową aplikację, wracasz, jest wybrana), pole celu, opcjonalny tekst do wpisania, przełączniki *Uzbrojone* / *Zezwól na nieodwracalne*, limit kroków, Start (Ctrl+Enter) / Stop (Esc), log kroków na żywo (co pętla zobaczyła, co zdecydował Jev, co zrobiła) i podsumowanie z kosztem. Okno nigdy nie jest celem: pętla wysuwa wybrane okno na wierzch i blokuje się na jego procesie. Renderowanie: egui/wgpu (DX12), czytniki ekranu przez AccessKit.
+**Okno** — `ultracuse.exe` bez argumentów (dwuklik) otwiera okno: wybór okna docelowego (lista albo „🎯 wskaż okno”: klikasz w docelową aplikację lub pulpit, wracasz, jest wybrana — jednorazowo, więc wycieczka do innego okna po drodze nie podmieni celu), pole celu, opcjonalny tekst do wpisania, przełączniki *Uzbrojone* / *Zezwól na nieodwracalne*, limit kroków, Start (Ctrl+Enter) / Stop (Esc), log kroków na żywo (co pętla zobaczyła, co zdecydował Jev, co zrobiła) i podsumowanie z kosztem. Okno nigdy nie jest celem: pętla wysuwa wybrane okno na wierzch i blokuje się na jego procesie. Renderowanie: egui/wgpu (DX12), czytniki ekranu przez AccessKit.
 
 **CLI** — te same możliwości z terminala:
 
@@ -42,7 +42,7 @@ ultracuse run "Wpisz „hello ultracuse” w edytorze tekstu" --act      # uzbro
 ultracuse run "Zamknij kartę bez zapisywania zmian" --act --allow-irreversible --hwnd 23399772
 ```
 
-Co robi jeden krok: skan UIA okna na wierzchu → redukcja do ≤ 60 kandydatów → **jedno** wywołanie Jev z siedmioma pytaniami (`target`, `op`, `key`, `goal_reached`, `goal_pending`, `needs_text`, `is_destructive`) → bramka w kodzie (progi, zgodność sygnałów, lista nieodwracalnych) → `SendInput` → settle. Tekst do wpisania bierze z cudzysłowu w celu („…”, "…", '…') albo z `--text`; Jev nigdy nie generuje tekstu.
+Co robi jeden krok: skan UIA okna na wierzchu → redukcja do ≤ 60 kandydatów (+ syntetyczne „tło (puste miejsce)” okna, żeby dało się kliknąć prawym w pulpit) → **jedno** wywołanie Jev z siedmioma pytaniami (`target`, `op`, `key`, `goal_reached`, `goal_pending`, `needs_text`, `is_destructive`) → bramka w kodzie (progi, zgodność sygnałów, lista nieodwracalnych) → `SendInput` → settle. Tekst do wpisania bierze z cudzysłowu w celu („…”, "…", '…') albo z `--text`; Jev nigdy nie generuje tekstu.
 
 **System Two (opcjonalnie)** — model czatu z OpenRouter obok pętli, nigdy zamiast niej ([docs/05-ADR-system-two.md](docs/05-ADR-system-two.md)): na starcie plan podcelów (pętla nie czeka — plan wchodzi „między wierszami” przy kolejnym kroku), ratunek, gdy Jev utknie (`Uncertain`), tekst, gdy cel go wymaga, a nikt nie podyktował. Każda propozycja przechodzi te same bramki w kodzie co decyzja Jev. Okno: Ustawienia → System Two (włącz, model z listy OpenRouter z ceną, wyszukiwarka, ulubione; wybór zapisany w `ultracuse.settings.json` obok exe). CLI: `--two` (domyślny `google/gemini-2.5-flash-lite`, `UC_TWO_MODEL` nadpisuje) albo `--two-model openai/gpt-4.1-mini`. Klucz: `OPENROUTER_API_KEY` / `OPEN_ROUTER_API_KEY` w zmiennych użytkownika; maksymalnie 3 wywołania na przebieg, koszt w podsumowaniu i ledgerze.
 

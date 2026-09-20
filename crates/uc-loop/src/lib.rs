@@ -44,6 +44,12 @@ pub mod consts {
     /// Pop-ups of the target process scanned in addition to the foreground window
     /// (a menu and its sub-menu, a drop-down, an owned dialog).
     pub const MAX_POPUPS: usize = 3;
+    /// Name of the synthetic element that stands for an empty spot of the target
+    /// window: the only way to say "right-click the background" (desktop → New…).
+    pub const BACKGROUND_NAME: &str = "background (empty area)";
+    /// Caption / tab strip height skipped when looking for an empty spot, px.
+    pub const BACKGROUND_TOP_SKIP: i32 = 48;
+    pub const BACKGROUND_MARGIN: i32 = 16;
     /// System Two (OpenRouter chat model) consultations per run: one plan + rescues.
     pub const TWO_MAX_CALLS: u32 = 3;
     /// How long the loop waits for a rescue when Jev is stuck (kill switch and stop
@@ -797,7 +803,7 @@ pub fn perceive(
         front.append(&mut scan.elements);
         scan.elements = front;
     }
-    let reduced = uc_uia::reduce(
+    let mut reduced = uc_uia::reduce(
         &scan.elements,
         uc_uia::ReduceOpts {
             max_n,
@@ -806,11 +812,62 @@ pub fn perceive(
             ..Default::default()
         },
     );
+    // The background is a target too (context menu of the desktop or of an empty
+    // canvas); UIA has no element for it, so one is synthesised at a free spot of the
+    // main window — after `reduce`, so the candidate cap never drops it.
+    if let Some((x, y)) = empty_spot(scene.rect, &reduced) {
+        reduced.push(uc_uia::Element {
+            i: reduced.len(),
+            role: "pane".into(),
+            name: consts::BACKGROUND_NAME.into(),
+            bbox: [x - 8, y - 8, 16, 16],
+            enabled: true,
+            val: None,
+            focused: false,
+            auto_id: None,
+        });
+    }
     Perception {
         scan,
         reduced,
         popups,
     }
+}
+
+/// A point inside `rect` (below the caption, inside the margins) that no element
+/// covers — the centre first, then a coarse grid ordered by distance from the centre.
+/// `None` when the window is fully covered (a maximised document, a list view).
+pub fn empty_spot(rect: uc_win32::Rect, els: &[uc_uia::Element]) -> Option<(i32, i32)> {
+    let [rx, ry, rw, rh] = rect;
+    let m = consts::BACKGROUND_MARGIN;
+    let (x0, y0) = (rx + m, ry + consts::BACKGROUND_TOP_SKIP);
+    let (x1, y1) = (rx + rw - m, ry + rh - m);
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    let covered = |x: i32, y: i32| {
+        els.iter().any(|e| {
+            let [ex, ey, ew, eh] = e.bbox;
+            x >= ex - 12 && x < ex + ew + 12 && y >= ey - 12 && y < ey + eh + 12
+        })
+    };
+    let (cx, cy) = ((x0 + x1) / 2, (y0 + y1) / 2);
+    if !covered(cx, cy) {
+        return Some((cx, cy));
+    }
+    let step = ((x1 - x0) / 12).max(48);
+    let mut grid: Vec<(i32, i32)> = Vec::new();
+    let mut y = y0;
+    while y < y1 {
+        let mut x = x0;
+        while x < x1 {
+            grid.push((x, y));
+            x += step;
+        }
+        y += step;
+    }
+    grid.sort_by_key(|(x, y)| (x - cx).abs() + (y - cy).abs());
+    grid.into_iter().find(|&(x, y)| !covered(x, y))
 }
 
 #[derive(Clone, Debug)]
@@ -1942,6 +1999,21 @@ mod tests {
             plan2.as_deref(),
             Some(&["open the menu".to_string(), "overall".to_string()][..])
         );
+    }
+
+    #[test]
+    fn empty_spot_prefers_centre_then_grid_then_gives_up() {
+        let rect = [0, 0, 1000, 800];
+        assert_eq!(empty_spot(rect, &[]), Some((500, 416)));
+        let mut mid = el(0, "button", "Mid");
+        mid.bbox = [400, 350, 200, 150];
+        assert!(
+            matches!(empty_spot(rect, &[mid.clone()]), Some((x, y)) if !(388..612).contains(&x) || !(338..512).contains(&y))
+        );
+        let mut all = el(1, "document", "Doc");
+        all.bbox = [-20, -20, 1040, 840];
+        assert_eq!(empty_spot(rect, &[all]), None);
+        assert_eq!(empty_spot([0, 0, 20, 20], &[]), None);
     }
 
     #[test]
