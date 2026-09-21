@@ -16,3 +16,15 @@ Czasy kroków (ledgery): krok elementowy — scan 78–487 ms, Jev 274–324 ms,
 - 01 to nie błąd drabiny: w Notatniku „Plik → Zapisz jako → Pulpit" jest legalną drogą do pliku na pulpicie, więc Jev ma prawo zostać. Przegląd okien uruchamia się, gdy okno nie ma pasującego elementu — a nie dlatego, że *my* uważamy, że to złe okno.
 - Krok przeglądu nie jest „~200 tokenów", jak zakładał ADR-004 w pierwszej wersji: tytuły 24 okien jako kryteria pytania kosztują tyle co mały krok elementowy. Nadal 1 wywołanie Jev, ~0.28 s, ~$0.0001.
 - Wynik negatywny / nie zmierzone: przebieg z `--act` (faktyczne minimalizowanie okien, klik w tło pulpitu, przełączenie), przemieszczenie przez użytkownika i `FocusLost`, szczebel 3 (System Two — płatny model, osobna zgoda), skalowanie DPI i przycięcie tła do obszaru roboczego (poprawki po przeglądzie PR #5 — tylko testy jednostkowe).
+
+## Dogrywka na finalnym kodzie (`main` bccc039, 2026-09-21 01:55, bez bramki bezczynności — na prośbę użytkownika)
+
+Ledgery: `r6/04-filezilla-closed-final-exe.jsonl`, `r6/05-recycle-bin-final-exe.jsonl`.
+
+| # | cel (start: Notatnik) | krok 1 | krok 2 (przegląd) | wynik | Jev | koszt |
+|---|---|---|---|---|---|---|
+| 04 | „Połącz się z serwerem FTP w programie FileZilla" — **FileZilla zamknięta** | `target none` 0.43, op click 0.58 → niepewny | `none` **0.96**, desktop 0.03, Notatnik 0.01 → „no open window fits the goal" | Uncertain, 2 kroki, 789 ms | 2 | $0.00023 |
+| 05 | „Otwórz Kosz, który jest na pulpicie" | `target none` 0.43, op key 0.39 → niepewny | `desktop` **0.89**, none 0.09, Notatnik 0.02 → **show desktop** | Preview, 2 kroki, 773 ms | 2 | $0.00022 |
+
+- Krok przeglądu po poprawkach: `scan 0 ms (0→0)` (bez UIA), 1.5 k tokenów stanu (wcześniej 2.3–2.5 k ze skanem), tytuły okien obok id w `survey`.
+- 04 to poprawny wynik negatywny: właściwego okna nie ma, więc przegląd mówi `none`, a bez System Two drabina kończy się `Uncertain` zamiast zgadywać.
